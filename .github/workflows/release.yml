@@ -57,12 +57,17 @@ jobs:
             # The tag has to be on the default branch. A release built from a side
             # branch is a release nobody reviewed, and the artifacts are immutable
             # once published.
+            #
+            # The ref is resolved to a commit first: for an annotated tag
+            # `github.sha` is the tag object, which is an ancestor of nothing, and the
+            # check would reject a tag that is perfectly fine.
+            commit="$(git rev-list -n 1 "$GITHUB_REF")"
             default_branch="${{ github.event.repository.default_branch }}"
             if ! git rev-parse --verify --quiet "origin/$default_branch" >/dev/null; then
               git fetch --no-tags origin "$default_branch"
             fi
-            if git merge-base --is-ancestor "$GITHUB_SHA" "origin/$default_branch"; then
-              echo "v$version is on $default_branch"
+            if git merge-base --is-ancestor "$commit" "origin/$default_branch"; then
+              echo "v$version ($commit) is on $default_branch"
             else
               echo "::error::v$version is not an ancestor of origin/$default_branch; merge it before tagging"
               exit 1
