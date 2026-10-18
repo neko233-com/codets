@@ -32,6 +32,11 @@ pub struct InstallOptions {
     pub include_dev: bool,
     /// Delete `node_modules` before installing.
     pub clean: bool,
+    /// The executable the `node_modules/.bin` shims should call. `None` means the
+    /// running executable, which is the installed toolchain and therefore right in
+    /// production; a test passes its own binary so that a shim can be run rather
+    /// than only read.
+    pub runner: Option<PathBuf>,
 }
 
 /// One package that ended up on disk.
@@ -42,6 +47,8 @@ pub struct InstalledPackage {
     pub path: PathBuf,
     /// Size of what was written, for the summary.
     pub bytes: u64,
+    /// Where it came from, in the shape npm records in `package-lock.json`.
+    pub resolved: String,
 }
 
 /// The result of an install.
@@ -91,6 +98,10 @@ pub fn install(project: &Path, options: &InstallOptions) -> Result<InstallReport
     let mut warnings: Vec<String> = Vec::new();
     let mut resolved: BTreeMap<String, (Semver, VersionInfo)> = BTreeMap::new();
     let mut metadata_cache: HashMap<String, super::registry::PackageMetadata> = HashMap::new();
+    // Whether every declared package could be explained from the registry. Pruning
+    // is only safe when it could: otherwise a network failure would delete a working
+    // `node_modules` and leave a warning behind.
+    let mut complete = true;
     let mut index = 0;
     while index < order.len() {
         let name = order[index].clone();
@@ -107,6 +118,8 @@ pub fn install(project: &Path, options: &InstallOptions) -> Result<InstallReport
                 "{name}: range `{}` is not a registry version, so it was skipped",
                 ranges.join(", ")
             ));
+            // Whatever that range names is not ours to remove from node_modules.
+            complete = false;
             continue;
         }
         let metadata = match metadata_cache.get(&name) {
@@ -118,6 +131,7 @@ pub fn install(project: &Path, options: &InstallOptions) -> Result<InstallReport
                 }
                 Err(error) => {
                     warnings.push(format!("{name}: {error}"));
+                    complete = false;
                     continue;
                 }
             },
@@ -148,6 +162,7 @@ pub fn install(project: &Path, options: &InstallOptions) -> Result<InstallReport
                 "{name}: no published version satisfies {}",
                 ranges.join(", ")
             ));
+            complete = false;
             continue;
         };
         if parsed.len() > 1
@@ -194,8 +209,16 @@ pub fn install(project: &Path, options: &InstallOptions) -> Result<InstallReport
     }
     packages.sort_by(|left, right| left.name.cmp(&right.name));
 
-    // ---- bin links and lockfile
-    link_binaries(&modules_dir, &packages);
+    // ---- prune, bin links and lockfile
+    if complete {
+        prune(&modules_dir, &resolved);
+    } else {
+        warnings.push(
+            "node_modules was left as it is, because not every dependency could be resolved"
+                .to_string(),
+        );
+    }
+    link_binaries(&modules_dir, &packages, options);
     write_lockfile(project, &manifest, &packages, options)?;
 
     Ok(InstallReport {
@@ -219,7 +242,7 @@ fn fetch_and_place(
     info: &VersionInfo,
 ) -> Result<InstalledPackage, String> {
     let source = registry.source(name, info)?;
-    let written = match source {
+    let (written, resolved) = match source {
         PackageSource::Tarball(bytes) => {
             verify_integrity(name, info, &bytes)?;
             let destination = modules.join(name);
@@ -228,16 +251,18 @@ fn fetch_and_place(
             }
             std::fs::create_dir_all(&destination)
                 .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
-            unpack(&bytes, &destination)
-                .map_err(|error| format!("{name}: cannot unpack the tarball: {error}"))?
+            let written = unpack(&bytes, &destination)
+                .map_err(|error| format!("{name}: cannot unpack the tarball: {error}"))?;
+            (written, tarball_url(registry, name, info))
         }
         PackageSource::Extracted(from) => {
             let destination = modules.join(name);
             if destination.exists() {
                 let _ = std::fs::remove_dir_all(&destination);
             }
-            copy_tree(&from, &destination)
-                .map_err(|error| format!("{name}: cannot copy {}: {error}", from.display()))?
+            let written = copy_tree(&from, &destination)
+                .map_err(|error| format!("{name}: cannot copy {}: {error}", from.display()))?;
+            (written, format!("file:{}", from.display()))
         }
     };
     Ok(InstalledPackage {
@@ -245,7 +270,85 @@ fn fetch_and_place(
         version: info.version.clone(),
         path: modules.join(name),
         bytes: written,
+        resolved,
     })
+}
+
+/// Where a package came from, in the shape npm writes into `resolved`.
+///
+/// For an HTTP registry that is the tarball URL npm would have recorded. A
+/// directory registry has no URL, so it becomes a `file:` path — which is also how
+/// npm spells a local package.
+fn tarball_url(registry: &Registry, name: &str, info: &VersionInfo) -> String {
+    if info.tarball.starts_with("http://") || info.tarball.starts_with("https://") {
+        return info.tarball.clone();
+    }
+    match registry {
+        Registry::Directory { root } => {
+            let path = if info.tarball.is_empty() {
+                root.join(name).join(info.version.to_string())
+            } else {
+                root.join(&info.tarball)
+            };
+            format!("file:{}", path.display())
+        }
+        Registry::Http { .. } => info.tarball.clone(),
+    }
+}
+
+/// Remove everything in `node_modules` that this install no longer explains.
+///
+/// npm prunes, and so must this: an install that leaves yesterday's package behind
+/// is not idempotent, and the stale copy is invisible until something imports it.
+/// Only called when every declared package resolved.
+fn prune(modules: &Path, resolved: &BTreeMap<String, (Semver, VersionInfo)>) {
+    let Ok(entries) = std::fs::read_dir(modules) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".bin" {
+            continue;
+        }
+        if name.starts_with('@') {
+            // A scope directory holds packages rather than being one, so each of its
+            // children is judged on its full `@scope/name`.
+            let mut remaining = 0;
+            if let Ok(children) = std::fs::read_dir(entry.path()) {
+                for child in children.flatten() {
+                    let full = format!("{name}/{}", child.file_name().to_string_lossy());
+                    if resolved.contains_key(&full) {
+                        remaining += 1;
+                    } else {
+                        remove_any(&child.path());
+                    }
+                }
+            }
+            if remaining == 0 {
+                remove_any(&entry.path());
+            }
+            continue;
+        }
+        if !resolved.contains_key(&name) {
+            remove_any(&entry.path());
+        }
+    }
+}
+
+/// Delete a file, a directory or a link, whichever `path` is.
+///
+/// `symlink_metadata` rather than `metadata`: a link is removed as a link, so a
+/// linked package never takes its target with it.
+fn remove_any(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(path);
+        }
+        Err(_) => {}
+    }
 }
 
 /// Check a tarball against the registry's `sha512-...` digest.
@@ -320,12 +423,22 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<u64> {
     Ok(written)
 }
 
-/// Write shims for every `bin` a package declares into `node_modules/.bin`.
-fn link_binaries(modules: &Path, packages: &[InstalledPackage]) {
+/// Write shims for every `bin` a package declares into `node_modules/.bin`, and drop
+/// the shims that no longer belong there.
+fn link_binaries(modules: &Path, packages: &[InstalledPackage], options: &InstallOptions) {
     let bin_dir = modules.join(".bin");
     if std::fs::create_dir_all(&bin_dir).is_err() {
         return;
     }
+    // The shims call the toolchain that installed them, which in production is the
+    // binary running this code.
+    let codets = match &options.runner {
+        Some(path) => path.display().to_string(),
+        None => std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "codets".to_string()),
+    };
+    let mut written: Vec<String> = Vec::new();
     for package in packages {
         let manifest = match super::read_manifest(&package.path.join("package.json")) {
             Ok(manifest) => manifest,
@@ -336,14 +449,12 @@ fn link_binaries(modules: &Path, packages: &[InstalledPackage]) {
             if !script.is_file() {
                 continue;
             }
-            let shim = if cfg!(windows) {
-                bin_dir.join(format!("{name}.cmd"))
+            let shim_name = if cfg!(windows) {
+                format!("{name}.cmd")
             } else {
-                bin_dir.join(name)
+                name.to_string()
             };
-            let codets = std::env::current_exe()
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "codets".to_string());
+            let shim = bin_dir.join(&shim_name);
             let script = script.to_string_lossy().to_string();
             let body = if cfg!(windows) {
                 format!("@echo off\r\n\"{codets}\" \"{script}\" %*\r\n")
@@ -355,6 +466,17 @@ fn link_binaries(modules: &Path, packages: &[InstalledPackage]) {
             {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755));
+            }
+            written.push(shim_name);
+        }
+    }
+    // A shim whose package was pruned would otherwise stay behind, and fail in a way
+    // that says nothing about why. npm regenerates this directory too.
+    if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !written.contains(&name) {
+                remove_any(&entry.path());
             }
         }
     }
@@ -397,7 +519,7 @@ fn write_lockfile(
         lock.push_str(&format!(
             "      \"version\": {},\n      \"resolved\": {},\n      \"license\": \"\"\n    }}",
             json_string(&package.version.to_string()),
-            json_string(&options.registry.describe())
+            json_string(&package.resolved)
         ));
     }
     lock.push_str("\n  }\n}\n");

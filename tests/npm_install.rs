@@ -12,19 +12,14 @@ use codets::npm::install::{base64_encode, install, InstallOptions};
 use codets::npm::registry::Registry;
 use sha2::{Digest, Sha512};
 
-/// A unique scratch directory for one test.
-fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "codets-npm-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.subsec_nanos())
-            .unwrap_or(0)
-    ));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).expect("scratch");
-    path
+mod support;
+
+use support::{tree, Scratch};
+
+/// A scratch directory for one test, removed when the test ends — including when it
+/// panics, which a trailing `remove_dir_all` does not manage.
+fn scratch(name: &str) -> Scratch {
+    Scratch::new(name)
 }
 
 fn write(path: &Path, body: &str) {
@@ -95,6 +90,17 @@ fn options(registry: &Path, jobs: usize) -> InstallOptions {
         jobs,
         include_dev: true,
         clean: true,
+        runner: None,
+    }
+}
+
+/// The same options with `clean` off, which is the case where pruning matters: a
+/// clean install deletes `node_modules` before it starts and can hide the absence of
+/// pruning entirely.
+fn options_keeping_the_tree(registry: &Path, jobs: usize) -> InstallOptions {
+    InstallOptions {
+        clean: false,
+        ..options(registry, jobs)
     }
 }
 
@@ -117,7 +123,6 @@ fn installs_a_package_from_a_tarball() {
     assert!(installed.join("index.js").is_file());
     // The leading `package/` component must be stripped on the way out.
     assert!(!installed.join("package").exists(), "archive prefix was kept");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -145,7 +150,6 @@ fn a_bad_integrity_stops_that_package() {
         report.warnings
     );
     assert!(!project.join("node_modules").join("tampered").join("index.js").exists());
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -159,7 +163,6 @@ fn verifies_a_correct_integrity() {
     let report = install(&project, &options(&registry, 3)).expect("install");
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     assert_eq!(report.packages.len(), 1);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -183,7 +186,6 @@ fn resolves_and_installs_transitively() {
         .find(|package| package.name == "greeter")
         .expect("greeter");
     assert_eq!(greeter.version.to_string(), "1.1.0");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -213,7 +215,13 @@ fn one_thread_and_many_threads_agree() {
         .collect();
     assert_eq!(serial_versions, parallel_versions);
     assert_eq!(parallel.jobs, 2, "two packages cannot use more than two workers");
-    let _ = std::fs::remove_dir_all(&root);
+    // Not just the same packages: the same bytes. Thread count must not be
+    // observable in the result, or an install would depend on the machine.
+    assert_eq!(
+        tree(&serial_project),
+        tree(&parallel_project),
+        "the thread count changed what was written"
+    );
 }
 
 #[test]
@@ -231,7 +239,6 @@ fn writes_an_npm_shaped_lockfile() {
     assert!(lock.contains("\"node_modules/shout\""), "{lock}");
     // It must be valid JSON, which is the property another tool would depend on.
     assert!(codets::builtins::json::parse(&lock).is_some(), "{lock}");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -265,7 +272,6 @@ fn links_declared_binaries_into_dot_bin() {
     assert!(shim.is_file(), "missing shim {}", shim.display());
     let body = std::fs::read_to_string(&shim).expect("shim");
     assert!(body.contains("bin.js"), "{body}");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -278,7 +284,6 @@ fn a_package_range_that_matches_nothing_is_a_warning_not_a_panic() {
     let report = install(&project, &options(&registry, 2)).expect("install runs");
     assert!(report.packages.is_empty());
     assert!(!report.warnings.is_empty(), "expected a warning");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -291,7 +296,215 @@ fn nothing_installed_leaves_an_empty_node_modules() {
     let report = install(&project, &options(&registry, 2)).expect("install");
     assert!(report.packages.is_empty());
     assert!(project.join("node_modules").is_dir());
-    let _ = std::fs::remove_dir_all(&root);
+}
+
+// -------------------------------------------------------------- idempotency
+
+#[test]
+fn installing_twice_changes_nothing() {
+    let registry = fixture_registry();
+    let root = scratch("twice");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    project_json(&project, "\"greeter\": \"^1.0.0\"");
+
+    let first = install(&project, &options_keeping_the_tree(&registry, 4)).expect("first install");
+    let after_first = tree(&project);
+    let lockfile = std::fs::read(project.join("package-lock.json")).expect("lockfile");
+
+    let second = install(&project, &options_keeping_the_tree(&registry, 4)).expect("second install");
+    let after_second = tree(&project);
+
+    assert_eq!(first.packages.len(), 2, "greeter and its transitive shout");
+    assert_eq!(second.packages.len(), 2);
+    // The whole tree, contents included: the lockfile has to come out byte for byte
+    // the same, or every install would show up as a change to version control.
+    assert_eq!(after_first, after_second, "a second install changed the tree");
+    assert_eq!(
+        lockfile,
+        std::fs::read(project.join("package-lock.json")).expect("lockfile"),
+        "the lockfile was rewritten differently"
+    );
+}
+
+#[test]
+fn a_removed_dependency_is_pruned() {
+    let registry = fixture_registry();
+    let root = scratch("prune");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    project_json(&project, "\"greeter\": \"^1.0.0\"");
+    install(&project, &options_keeping_the_tree(&registry, 4)).expect("first install");
+    assert!(project.join("node_modules/greeter").is_dir());
+    assert!(project.join("node_modules/shout").is_dir(), "the transitive dependency");
+
+    // Drop the dependency, as someone editing package.json would.
+    project_json(&project, "");
+    let report = install(&project, &options_keeping_the_tree(&registry, 4)).expect("second install");
+    assert!(report.packages.is_empty());
+
+    // Both the direct and the transitive package are gone: a `node_modules` that
+    // keeps them is not the tree the manifest describes.
+    assert!(
+        !project.join("node_modules/greeter").exists(),
+        "greeter survived being removed from the manifest"
+    );
+    assert!(
+        !project.join("node_modules/shout").exists(),
+        "the transitive dependency survived"
+    );
+}
+
+#[test]
+fn a_scoped_package_is_pruned_with_its_scope_directory() {
+    let root = scratch("prune-scope");
+    let registry = root.join("registry");
+    std::fs::create_dir_all(&registry).expect("registry");
+    registry_with_tarball(&registry, "@scope/thing", "1.0.0", None);
+    let project = root.join("project");
+    project_json(&project, "\"@scope/thing\": \"^1.0.0\"");
+
+    install(&project, &options_keeping_the_tree(&registry, 2)).expect("first install");
+    assert!(project.join("node_modules/@scope/thing/index.js").is_file());
+
+    project_json(&project, "");
+    install(&project, &options_keeping_the_tree(&registry, 2)).expect("second install");
+    assert!(
+        !project.join("node_modules/@scope").exists(),
+        "an empty scope directory was left behind"
+    );
+}
+
+#[test]
+fn a_failed_resolution_does_not_prune() {
+    // A range that matches nothing is a warning, and an install that cannot explain
+    // the manifest must not delete what is already there: a typo in the registry URL
+    // would otherwise wipe a working node_modules.
+    let registry = fixture_registry();
+    let root = scratch("no-prune");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    project_json(&project, "\"greeter\": \"^99.0.0\"");
+    let survivor = project.join("node_modules/from-an-earlier-install");
+    std::fs::create_dir_all(&survivor).expect("survivor");
+    std::fs::write(survivor.join("index.js"), "// keep me").expect("file");
+
+    let report = install(&project, &options_keeping_the_tree(&registry, 2)).expect("install runs");
+    assert!(!report.warnings.is_empty());
+    assert!(
+        survivor.join("index.js").is_file(),
+        "an unresolvable manifest deleted an unrelated package"
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("left as it is")),
+        "the reason should be reported: {:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn the_lockfile_records_where_each_package_came_from() {
+    let registry = fixture_registry();
+    let root = scratch("lockfile-resolved");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    project_json(&project, "\"greeter\": \"^1.0.0\"");
+    install(&project, &options_keeping_the_tree(&registry, 2)).expect("install");
+
+    let lock = std::fs::read_to_string(project.join("package-lock.json")).expect("lockfile");
+    // `file:` is how npm spells a local package; `directory <path>` was this
+    // installer talking to itself, and no other tool can read it.
+    assert!(lock.contains("\"resolved\": \"file:"), "{lock}");
+    assert!(!lock.contains("directory "), "not npm-shaped: {lock}");
+    // Path separators differ per platform, and JSON escapes them.
+    let normalized = lock.replace("\\\\", "/").replace('\\', "/");
+    assert!(normalized.contains("greeter/1.1.0"), "{lock}");
+}
+
+#[test]
+fn a_bin_shim_runs_the_package_script() {
+    // The shim has to be runnable, not merely present: this installs a package with
+    // a `bin`, then runs the shim the way a `npm run` script would.
+    let root = scratch("bin-runs");
+    let registry = root.join("registry");
+    std::fs::create_dir_all(&registry).expect("registry");
+    write(
+        &registry.join("cli.json"),
+        "{ \"versions\": { \"1.0.0\": { \"dist\": { \"tarball\": \"cli-1.0.0.tgz\" } } } }",
+    );
+    write(
+        &registry.join("cli/1.0.0/package.json"),
+        "{ \"name\": \"cli\", \"version\": \"1.0.0\", \"bin\": { \"cli-tool\": \"bin.js\" } }",
+    );
+    write(&registry.join("cli/1.0.0/bin.js"), "console.log('cli ran');");
+    let project = root.join("project");
+    project_json(&project, "\"cli\": \"^1.0.0\"");
+
+    // The toolchain the shim should call, which in production is the running binary.
+    let mut with_runner = options(&registry, 2);
+    with_runner.runner = Some(PathBuf::from(env!("CARGO_BIN_EXE_node")));
+    install(&project, &with_runner).expect("install");
+
+    let shim = if cfg!(windows) {
+        project.join("node_modules/.bin/cli-tool.cmd")
+    } else {
+        project.join("node_modules/.bin/cli-tool")
+    };
+    let output = if cfg!(windows) {
+        Command::new("cmd")
+            .arg("/C")
+            .arg(&shim)
+            .output()
+            .expect("run the shim")
+    } else {
+        Command::new(&shim).output().expect("run the shim")
+    };
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("cli ran"),
+        "{:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn a_pruned_package_loses_its_shim() {
+    let root = scratch("prune-bin");
+    let registry = root.join("registry");
+    std::fs::create_dir_all(&registry).expect("registry");
+    write(
+        &registry.join("cli.json"),
+        "{ \"versions\": { \"1.0.0\": { \"dist\": { \"tarball\": \"cli-1.0.0.tgz\" } } } }",
+    );
+    write(
+        &registry.join("cli/1.0.0/package.json"),
+        "{ \"name\": \"cli\", \"version\": \"1.0.0\", \"bin\": { \"cli-tool\": \"bin.js\" } }",
+    );
+    write(&registry.join("cli/1.0.0/bin.js"), "console.log('cli ran');");
+    let project = root.join("project");
+    project_json(&project, "\"cli\": \"^1.0.0\"");
+    install(&project, &options_keeping_the_tree(&registry, 2)).expect("first install");
+
+    project_json(&project, "");
+    install(&project, &options_keeping_the_tree(&registry, 2)).expect("second install");
+
+    let bin_dir = project.join("node_modules/.bin");
+    let left: Vec<String> = std::fs::read_dir(&bin_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(left.is_empty(), "stale shims survived the prune: {left:?}");
 }
 
 // ------------------------------------------------------------ the whole chain
@@ -348,5 +561,4 @@ fn npm_install_then_node_runs_the_program() {
     // `shout` upper-cases what `greeter` passes it, which proves the transitive
     // require resolved through `node_modules`.
     assert!(printed.contains("HI WORLD"), "{printed}");
-    let _ = std::fs::remove_dir_all(&root);
 }

@@ -62,6 +62,7 @@ pub mod net;
 pub mod node;
 pub mod npm;
 pub mod parser;
+pub mod release;
 pub mod value;
 pub mod versions;
 

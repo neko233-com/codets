@@ -51,15 +51,28 @@ fn with_agent<T>(work: impl FnOnce(&Agent) -> T) -> T {
     })
 }
 
+/// The most a single response may be, in bytes.
+///
+/// ureq's own default is 10 MiB, and a registry packument can be larger: `vite`'s is,
+/// which made every package with a big version history fail to install with
+/// "the response body is larger than request limit". Tarballs need room too — they
+/// are held in memory while they are unpacked — so this is set high enough not to be
+/// a real limit, and kept at all only so that a runaway or hostile server cannot
+/// exhaust the machine.
+const MAX_RESPONSE: u64 = 512 * 1024 * 1024;
+
 /// Fetch a URL into memory.
 pub fn get_bytes(url: &str) -> Result<Vec<u8>, String> {
     with_agent(|agent| {
-        let response = agent
+        let mut response = agent
             .get(url)
             .call()
             .map_err(|error| format!("GET {url} failed: {error}"))?;
-        let mut body = response.into_body();
-        body.read_to_vec()
+        response
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE)
+            .read_to_vec()
             .map_err(|error| format!("reading {url} failed: {error}"))
     })
 }

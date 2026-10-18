@@ -12,6 +12,7 @@
 //! no `audit`/`publish`.
 
 pub mod install;
+pub mod npmrc;
 pub mod registry;
 pub mod semver;
 
@@ -110,9 +111,14 @@ Commands:
   run <script> [-- <args>]   Run a package.json script
   exec <command> [args]      Run a binary from node_modules/.bin
   list                       List installed packages
+  config get registry        Where packages would come from
   init                       Create a package.json
   --version                  Print the npm shim version
   --help                     Print this help
+
+The registry comes from `--registry`, then `NPM_CONFIG_REGISTRY`, then the nearest
+`.npmrc`, then `~/.npmrc`, then npmjs.org. `npm config get registry` prints the one
+that would be used; add `--origin` on stderr to see which of those decided it.
 
 Package tarballs are fetched, integrity-checked and unpacked on several threads
 at once. JavaScript itself still runs single-threaded, as the language requires.
@@ -146,6 +152,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
         "run" | "run-script" => run_script(&project, args),
         "exec" | "x" => exec_command(&project, args),
         "list" | "ls" => list_command(&project),
+        "config" => config_command(&project, args),
         "init" => init_command(&project),
         other => {
             // `npm test` is shorthand for `npm run test`.
@@ -171,8 +178,8 @@ struct InstallFlags {
     save: bool,
 }
 
-fn install_flags(args: &[String]) -> Result<InstallFlags, String> {
-    let mut registry = Registry::default_registry();
+fn install_flags(project: &Path, args: &[String]) -> Result<InstallFlags, String> {
+    let mut registry_spec: Option<String> = None;
     let mut jobs = std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(4);
@@ -191,7 +198,10 @@ fn install_flags(args: &[String]) -> Result<InstallFlags, String> {
                 let spec = args
                     .get(index)
                     .ok_or_else(|| "npm: --registry needs a value".to_string())?;
-                registry = Registry::open(spec)?;
+                if spec.trim().is_empty() {
+                    return Err("npm: --registry needs a value".to_string());
+                }
+                registry_spec = Some(spec.clone());
             }
             "--jobs" | "-j" => {
                 index += 1;
@@ -213,7 +223,11 @@ fn install_flags(args: &[String]) -> Result<InstallFlags, String> {
             "--no-save" => save = false,
             "--silent" | "--quiet" | "--no-fund" | "--no-audit" | "--no-progress" => {}
             other if other.starts_with("--registry=") => {
-                registry = Registry::open(other.trim_start_matches("--registry="))?;
+                let spec = other.trim_start_matches("--registry=");
+                if spec.trim().is_empty() {
+                    return Err("npm: --registry needs a value".to_string());
+                }
+                registry_spec = Some(spec.to_string());
             }
             other if other.starts_with("--jobs=") => {
                 let value = other.trim_start_matches("--jobs=");
@@ -229,12 +243,16 @@ fn install_flags(args: &[String]) -> Result<InstallFlags, String> {
         index += 1;
     }
 
+    // The flag is only the first link of the chain; the rest lives in `npmrc`.
+    let choice = npmrc::resolve(registry_spec.as_deref(), project)?;
+
     Ok(InstallFlags {
         options: InstallOptions {
-            registry,
+            registry: choice.registry,
             jobs,
             include_dev,
             clean,
+            runner: None,
         },
         packages,
         save_dev,
@@ -242,8 +260,74 @@ fn install_flags(args: &[String]) -> Result<InstallFlags, String> {
     })
 }
 
+/// `npm config get <key>`, which is how a script finds out which registry a project
+/// will install from without guessing.
+fn config_command(project: &Path, args: Vec<String>) -> ExitCode {
+    let mut show_origin = false;
+    let mut explicit: Option<String> = None;
+    let mut key: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        match argument {
+            "--origin" => show_origin = true,
+            // `--registry` is a config override, so `config get registry --registry
+            // <url>` has to report the flag rather than read it as the key.
+            "--registry" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) if !value.trim().is_empty() => explicit = Some(value.clone()),
+                    _ => {
+                        eprintln!("npm: --registry needs a value");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            // npm accepts these spellings around `get`; none of them changes the
+            // answer, so they are accepted and ignored.
+            "get" | "-l" | "--long" | "--json" => {}
+            other if other.starts_with("--registry=") => {
+                let value = other.trim_start_matches("--registry=");
+                if value.trim().is_empty() {
+                    eprintln!("npm: --registry needs a value");
+                    return ExitCode::from(1);
+                }
+                explicit = Some(value.to_string());
+            }
+            other if other.starts_with('-') => {}
+            other => key = Some(other.to_string()),
+        }
+        index += 1;
+    }
+    let Some(key) = key else {
+        eprintln!("npm: config needs a key, for example `npm config get registry`");
+        return ExitCode::from(1);
+    };
+    if key != "registry" {
+        eprintln!(
+            "npm: `config get` knows only `registry`; {key} is read from a .npmrc but not by codets"
+        );
+        return ExitCode::from(1);
+    }
+    match npmrc::resolve(explicit.as_deref(), project) {
+        Ok(choice) => {
+            // A script piping this wants the value on its own, so where it came
+            // from is opt-in and goes to stderr.
+            println!("{}", choice.spec);
+            if show_origin {
+                eprintln!("{}", choice.describe());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("npm: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn install_command(project: &Path, args: Vec<String>) -> ExitCode {
-    let flags = match install_flags(&args) {
+    let flags = match install_flags(project, &args) {
         Ok(flags) => flags,
         Err(message) => {
             eprintln!("{message}");

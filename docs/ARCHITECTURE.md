@@ -123,10 +123,11 @@ declared later in the module are still exported.
 ## The Node layer
 
 **One binary, three personalities.** `argv[0]` decides whether the process is
-`codets`, `node` or `npm`, and `--codets-as=<name>` overrides it. The override
-exists because the version manager's shims are copies of the same executable: the
-operating system reports whatever filename it was invoked through, which is how a
-`node.cmd` shim ends up asking for Node's command line.
+`codets`, `node` or `npm`, and `--codets-as=<name>` overrides it. The operating
+system reports whatever name the binary was invoked through, and the store's links
+are named for the commands — so a link to `codets` is what a `node` command is
+asking for. The override remains for callers that invoke the binary directly rather
+than through one of its links.
 
 **Compatibility is a value, not a build flag.** `node::NodeCompat` is a Node
 release, and it is the single input to two decisions: what `process.version`
@@ -192,11 +193,12 @@ would be used — which is why the installer has no test-only code path.
 ## The version manager
 
 **A toolchain directory is a Node compatibility level.** `codets install 22`
-materialises `versions/22.12.0/` with a manifest and its own shims, and `use` points
-the store's `current` file at it. The shims pass `--node-version` and
-`--codets-as`, so one executable serves all three command names at whichever level
-is active. None of this needs the network; only replacing the *binary* does, which
-is what `codets upgrade --from` is for.
+materialises `versions/22.12.0/` with a manifest, the binary, and `node` and `npm`
+linked to it, and `use` points the store's `current` file at it and relinks `bin/`.
+Because a binary knows which level it is by where it lives, `versions/22.12.0/node`
+pins Node 22 whatever `current` says, and no argument has to be passed for any of
+this. None of it needs the network; only replacing the *binary* does, which is what
+`codets upgrade` is for.
 
 **Resolution is a chain with a defined order** — environment variable, project
 pin, current pointer, configured default, built-in default — because a version

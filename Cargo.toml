@@ -1,6 +1,6 @@
 [package]
 name = "codets"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.82"
 description = "codets: a pure-Rust JavaScript & TypeScript toolchain that replaces Node.js and npm, with native TypeScript support."

@@ -23,6 +23,36 @@ npm install                      # install dependencies
 codets use 22                    # switch the Node compatibility level
 ```
 
+## Install
+
+Windows:
+
+```powershell
+irm https://raw.githubusercontent.com/neko233-com/codets/main/install.ps1 | iex
+```
+
+Linux and macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/neko233-com/codets/main/install.sh | sh
+```
+
+Both pick the archive for your platform from the
+[releases](https://github.com/neko233-com/codets/releases), check it against the
+release's `codets-<version>-checksums.txt`, and hand the binary to `codets
+bootstrap`, which writes the store and puts `codets`, `node` and `npm` on `PATH`.
+Arguments go to `bootstrap`, so `... | sh -s -- --level 22` claims Node 22 rather
+than the built-in default. `CODETS_VERSION` pins a release, `CODETS_HOME` moves
+the store, and `CODETS_DOWNLOAD_BASE` / `CODETS_API_BASE` point the download at a
+mirror.
+
+Or build it yourself and install that build:
+
+```bash
+cargo build --release
+./target/release/codets bootstrap
+```
+
 ## Status
 
 This is an early but real implementation, and the numbers below were produced by
@@ -30,7 +60,7 @@ the commands in this repository rather than estimated:
 
 | | |
 |---|---|
-| Tests | **146 automated tests, all passing** (`cargo test`) |
+| Tests | **207 tests, all passing** (`cargo test`), plus 3 that need the network |
 | Real npm registry install | verified: `npm install` fetched `is-odd@3.0.1` and its transitive `is-number` from `registry.npmjs.org`, and `node index.js` ran the program |
 | Parallel install throughput | **5.34×** faster with 8 workers than 1 (24 packages, 41.8 MiB unpacked, identical trees) — `scripts/bench-npm-install.ps1` |
 | JavaScript throughput baseline | ~2.2M simple loop iterations/second (`bench-npm-install.ps1`, debug build) |
@@ -102,7 +132,8 @@ $ codets use 22                     # make it active for this machine
 $ codets use 22 --local             # ...or pin it for this project only
 $ codets current                    # what is active, and why
 $ codets versions                   # installed and available
-$ codets env                        # PATH setup for the shims
+$ codets env                        # PATH setup
+$ codets upgrade                    # replace this toolchain with a published build
 ```
 
 Resolution order for the active version, first match wins:
@@ -117,17 +148,20 @@ The store lives in `~/.codets` (or `$CODETS_HOME`):
 
 ```text
 ~/.codets/
-  bin/                     shims to put on PATH: codets, node, npm
-  versions/22.12.0/        one toolchain: manifest plus its own shims
+  bin/                     what goes on PATH: codets, node, npm
+  versions/22.12.0/        one toolchain: its own binary, its `node` and `npm`, a manifest
   current                  the active version
   settings.conf            `default=<version>`
 ```
 
-Installing a version materialises its directory and shims, which needs no network.
-Fetching a *newer* `codets` build is the only step that would, and
-`codets upgrade --from <path>` does that from a build you already have.
-`codets upgrade` without `--from` says plainly that it is not implemented in this
-build rather than pretending otherwise.
+`bin/` holds links to the active version's binary, not shell shims, and a version
+directory holds its own copy — so `versions/22.12.0/node app.ts` pins Node 22
+whatever `current` says, and `node.exe` never loses to a `node.cmd` on `PATH`.
+
+Installing a version copies the running binary into a version directory, which
+needs no network. `codets upgrade` is the only step that does: it fetches a
+published release, checks it against the release's checksum file, and installs it.
+`codets upgrade --from <path>` does the same from a build you already have.
 
 ## The package manager
 
@@ -143,9 +177,35 @@ be installed by `codets` and the other way round.
 * **Unpacking** — gunzip and untar, with the archive's leading `package/`
   directory stripped and escaping paths rejected.
 * **Binaries** — every declared `bin` gets a shim in `node_modules/.bin`.
-* **Lockfile** — `package-lock.json` is written in version 3's shape.
+* **Lockfile** — `package-lock.json` is written in version 3's shape, with the
+  `resolved` URL each package came from.
 * **Scripts** — `npm run <script>` runs with `node_modules/.bin` on `PATH` and
   npm's lifecycle variables set. `npm exec`, `npm list` and `npm init` work too.
+
+### Where packages come from
+
+The registry is resolved the way npm resolves it, highest priority first:
+
+1. `--registry <url|directory>`
+2. `NPM_CONFIG_REGISTRY`, or npm's lowercase `npm_config_registry`
+3. the project's `.npmrc`, found by walking up to the project root
+4. the user's `.npmrc` — `NPM_CONFIG_USERCONFIG`, `CODETS_NPMRC`, or `~/.npmrc`
+5. `https://registry.npmjs.org`
+
+So a mirror, a proxy or an internal registry needs no flag on any command:
+
+```console
+$ cat .npmrc
+registry=https://registry.npmmirror.com/
+
+$ npm config get registry                 # https://registry.npmmirror.com/
+$ npm config get registry --origin        # ...and which of the five decided it
+$ npm install                             # from the mirror, on every command
+```
+
+A `.npmrc` is not searched above the project root, which is the nearest directory
+holding a `package.json` or a `node_modules`. Walking further up would let an
+unrelated file — a stray `~/.npmrc`, say — change where a project installs from.
 
 ### Where the parallelism lives
 
@@ -164,6 +224,33 @@ added 24 packages in 0.24s (transfer 0.23s on 1 threads, 41.8 MiB)
 Reproduce that with `scripts/bench-npm-install.ps1`, which builds a local registry
 of real gzipped tarballs and reports both runs plus the speed-up. Both runs are
 checked to produce identical trees, so the comparison is meaningful.
+
+### The Vite 8 demo
+
+`examples/vite8-demo` is a real Vite 8 project, installed from the public registry
+rather than from a fixture. `scripts/verify-demo.ps1` (or `.sh`) drives it end to
+end and fails on the first thing that is wrong:
+
+```console
+$ scripts/verify-demo.ps1
+== 3/6 npm install
+added 40 packages in 6.23s (transfer 2.11s on 8 threads, 366.7 MiB)
+warnings: 0
+== 4/6 what the install produced
+vite 8.3.4, 40 packages in the lockfile, vite shim present
+== 5/6 the demo's own TypeScript
+vite@8
+codets@0.3
+vite + codets: 2 releases described
+```
+
+That run is what found the 10 MiB response limit described in the CHANGELOG: the
+packument for `vite` is larger, so before that fix the package could not be installed
+at all.
+
+What the demo does **not** do is run Vite's own command line, and it says so on every
+run: `vite dev` and `vite build` need `child_process` and native modules. See
+[`examples/vite8-demo/README.md`](examples/vite8-demo/README.md).
 
 ## What works
 
@@ -224,7 +311,19 @@ than an oversight:
 * **`require.cache` is a placeholder**, so cache eviction is not available.
 * **Importing a *relative* CommonJS file from an ES module is not interop-wrapped**;
   only bare package specifiers are. Reach relative CommonJS through `require`.
-* **Remote self-upgrade is not implemented**; `codets upgrade --from <path>` works.
+* **`codets upgrade` installs unverified when a release has no checksum file.** A
+  mismatch always stops it, and it never loads native code, but an archive served
+  without a checksum is trusted.
+* **The Vite command line cannot run.** `vite dev` and `vite build` spawn esbuild
+  through `child_process` and load Rolldown and lightningcss as native `.node`
+  modules; neither is implemented here. The Vite 8 demo installs its dependency tree
+  and runs its own TypeScript, which is what it claims to do.
+* **Scoped registries are not honoured.** `@scope:registry=` is read as an ordinary
+  key and ignored, so a package that needs its own registry has to be fetched with
+  `--registry` instead.
+* **A single response may not exceed 512 MiB.** That is a guard against a runaway
+  server rather than a limit real packages reach; the largest registry documents seen
+  are tens of megabytes.
 * **TLS is the platform's** (`native-tls`), so a Linux build needs the system
   OpenSSL headers at build time. This keeps `codets` itself free of a bundled TLS
   engine.
@@ -295,7 +394,7 @@ each layer.
 
 ```bash
 cargo build --release      # three binaries in target/release
-cargo test                 # 146 tests
+cargo test                 # 207 tests, offline
 ```
 
 On Windows with a Visual Studio installation that ships only the `onecore` toolset
@@ -315,11 +414,22 @@ src/
   commonjs.rs  core_modules.rs         require and the Node standard library
   npm/                                 semver, registries, the installer
   versions.rs                          the built-in version manager
+  release.rs                           where its own releases live, for `upgrade`
   net.rs                               the single place that uses the network
 tests/
   cli.rs  commonjs.rs  npm_install.rs  runtime.rs   fixtures/
+  release_contract.rs  install_scripts.rs          what a published release is
+  idempotency.rs  net.rs  live_registry.rs         twice, limits, the real thing
+  support/                           scratch directories and a fake release server
+examples/vite8-demo/                 a real Vite project, installed by codets
 docs/ARCHITECTURE.md
+AGENTS.md                            the release rule and the testing rules
 scripts/bench-npm-install.ps1
+scripts/pre-release.*                the gate a release has to pass locally
+scripts/check-temp-clean.*           the leak check
+scripts/verify-demo.*                the online end-to-end run
+install.sh  install.ps1              the one-line installers
+.github/workflows/release.yml        builds the assets both of them expect
 ```
 
 ## History
@@ -327,8 +437,11 @@ scripts/bench-npm-install.ps1
 This project was published as **`rust4ts`** (`0.1.0`), an embeddable JS/TS engine
 for Rust hosts. `0.2.0` turns it into `codets`: the toolchain, the Node-compatible
 command line, CommonJS, the core modules and the package manager are all new, and
-the embedding API from `0.1.0` still works unchanged. See
-[`CHANGELOG.md`](CHANGELOG.md).
+the embedding API from `0.1.0` still works unchanged.
+
+The work after `0.2.0` — self-upgrade, the one-line installers, the configurable
+registry, the release pipeline, and the test suite that proves each of them — is
+`0.3.0`; see [`CHANGELOG.md`](CHANGELOG.md).
 
 ## 中文说明
 
@@ -344,6 +457,14 @@ Node.js 与 npm。一次构建产出三个命令：`codets`、`node`、`npm`，�
 **多线程并行安装**——24 个包用 8 线程比 1 线程快 **5.34 倍**（`scripts/bench-npm-install.ps1`
 可复现，两次安装产物完全一致）。也已实测从 npm 官方源安装真实包
 （`is-odd` + 传递依赖 `is-number`）并成功运行。
+
+安装：Windows 用 `install.ps1`、Linux/macOS 用 `install.sh`（一行命令，见上文
+*Install*），两者都会核对发布产物的 SHA-256 后再交给 `codets bootstrap`；
+已经发布的版本可以用 `codets upgrade` 原地替换当前工具链。registry 的解析顺序
+与 npm 一致（`--registry` → `NPM_CONFIG_REGISTRY` → 项目 `.npmrc` → 用户 `.npmrc`
+→ 官方源），因此换镜像不需要给每条命令加参数；用
+`examples/vite8-demo`（真实 Vite 8 项目）验证过完整依赖树安装与自带 TypeScript
+直跑。
 
 **能力边界（重要）**：JS 执行语义按语言规范保持单线程，多线程只存在于 npm
 安装层；不支持原生插件（`.node`，它绑定 V8 的 ABI）、`Symbol`/`Proxy`/`Reflect`、

@@ -1,8 +1,22 @@
+# Build output.
 /target
 **/*.rs.bk
 
+# Tooling and editor state.
 .codely-cli/
 CODELY.md
 .idea/
 .vscode/
 *.tmp
+
+# Installed dependencies and what the demo projects generate. `node_modules/`
+# matches at any depth, which covers everything under examples/ as well.
+node_modules/
+examples/*/dist/
+examples/*/.vite/
+*.log
+
+# A demo's lockfile records whatever the registry had that day, so it is output,
+# not a source file. The lockfiles the test suite checks are written to the temp
+# directory and never reach the repository.
+examples/*/package-lock.json

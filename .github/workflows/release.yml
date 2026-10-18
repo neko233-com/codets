@@ -1,0 +1,199 @@
+# Builds and publishes the release assets `src/release.rs` expects.
+#
+# Every platform publishes `<archive>` + one shared checksum file, and the names are a
+# contract: `codets`'s own `upgrade` command and the one-line installers both
+# reconstruct them from the version and the target triple, so a rename here breaks
+# installed tools rather than failing loudly. `cargo test` covers the same names in
+# `release::tests::names_assets_the_way_the_pipeline_does`, and end to end in
+# `tests/release_contract.rs`.
+#
+# Windows publishes a `.tar.gz` like everyone else: it has shipped `tar.exe` since
+# Windows 10, and `codets` unpacks its own archives anyway.
+#
+# **Actions minutes are limited, so this runs on tags only.** `workflow_dispatch`
+# exists for a dry run: it builds and uploads the artifacts but creates no release.
+# Everything that can be checked without a runner is checked first, by
+# `scripts/pre-release` locally; the `verify` job below is the last gate before six
+# runners are spent.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Resolve the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      # The full history, so the tag can be checked against the default branch.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: resolve
+        shell: bash
+        run: |
+          set -eu
+          declared="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            # A tag that disagrees with the crate would publish assets whose names
+            # lie about their contents, and `upgrade` compares the two.
+            if [ "$version" != "$declared" ]; then
+              echo "::error::tag v$version does not match Cargo.toml's $declared"
+              exit 1
+            fi
+
+            # The tag has to be on the default branch. A release built from a side
+            # branch is a release nobody reviewed, and the artifacts are immutable
+            # once published.
+            default_branch="${{ github.event.repository.default_branch }}"
+            if ! git rev-parse --verify --quiet "origin/$default_branch" >/dev/null; then
+              git fetch --no-tags origin "$default_branch"
+            fi
+            if git merge-base --is-ancestor "$GITHUB_SHA" "origin/$default_branch"; then
+              echo "v$version is on $default_branch"
+            else
+              echo "::error::v$version is not an ancestor of origin/$default_branch; merge it before tagging"
+              exit 1
+            fi
+          else
+            version="$declared"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publishing codets $version"
+
+  verify:
+    name: Verify the tree
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The offline suite, which is everything in `cargo test`: the release contract,
+      # both installers end to end against a local HTTP server, and the idempotency
+      # cases. The online tests are `#[ignore]`d and run by hand before tagging.
+      - name: Tests
+        run: cargo test --locked
+      - name: Release build
+        run: cargo build --release --locked
+      # A test that leaks its scratch directory is a test that will do it on someone
+      # else's machine too.
+      - name: Nothing left in the temp directory
+        run: sh scripts/check-temp-clean.sh
+
+  build:
+    name: ${{ matrix.target }}
+    needs: [version, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # The arm64 label is a native arm64 runner. Cross-compiling from x86_64
+          # would need a C toolchain for the linker, which this project otherwise
+          # does without.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add the target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          stage="codets-${VERSION}-${TARGET}"
+          binary="codets"
+          case "$TARGET" in
+            *windows*) binary="codets.exe" ;;
+          esac
+          mkdir -p "dist/$stage"
+          cp "target/${TARGET}/release/${binary}" "dist/$stage/"
+          # The archive is a self-describing download, so carry the licence and the
+          # readme alongside the binary.
+          cp README.md LICENSE "dist/$stage/"
+          tar -C dist -czf "dist/${stage}.tar.gz" "$stage"
+          digest="$(sha256sum "dist/${stage}.tar.gz" | cut -d' ' -f1)"
+          # `<hex>  <name>`, the format `release::verify_checksum` parses.
+          printf '%s  %s\n' "$digest" "${stage}.tar.gz" > "dist/checksum-${TARGET}.txt"
+          cat "dist/checksum-${TARGET}.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codets-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/checksum-*.txt
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [version, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Collect the checksums
+        shell: bash
+        run: |
+          set -eu
+          cd dist
+          # One file covers every asset, which is what `verify_checksum` reads.
+          sort -k2 checksum-*.txt > "codets-${VERSION}-checksums.txt"
+          cat "codets-${VERSION}-checksums.txt"
+      - name: Take the release notes from the changelog
+        shell: bash
+        run: |
+          set -eu
+          awk -v version="$VERSION" '
+            $0 ~ "^## \\[" version "\\]" { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "codets ${VERSION}." > notes.md
+          fi
+          echo "Writing v${VERSION} with:"
+          cat notes.md
+      - name: Create the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          gh release create "v${VERSION}" \
+            --title "codets ${VERSION}" \
+            --notes-file notes.md \
+            dist/*.tar.gz "dist/codets-${VERSION}-checksums.txt"

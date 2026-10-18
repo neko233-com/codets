@@ -8,40 +8,33 @@ use std::path::{Path, PathBuf};
 
 use codets::{Error, Language, Runtime};
 
+mod support;
+
+use support::Scratch;
+
 /// The console output of running `entry` in a project built from `files`.
 struct Outcome {
     output: String,
     error: Option<String>,
 }
 
-fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "codets-cjs-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.subsec_nanos())
-            .unwrap_or(0)
-    ));
-    let _ = std::fs::remove_dir_all(&root);
+/// Write a small project into a scratch directory, which the caller keeps for as
+/// long as it needs and which removes itself afterwards.
+fn project(name: &str, files: &[(&str, &str)]) -> Scratch {
+    let root = Scratch::new(name);
     for (relative, body) in files {
-        let path = root.join(relative);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("create directory");
-        }
-        std::fs::write(&path, body).expect("write file");
+        root.write(relative, body);
     }
     root
 }
 
 fn run_commonjs(name: &str, files: &[(&str, &str)], entry: &str) -> Outcome {
     let root = project(name, files);
-    let mut runtime = Runtime::with_root(&root);
+    let mut runtime = Runtime::with_root(root.path());
     let buffer = runtime.capture_output();
     let result = codets::commonjs::run_entry(&mut runtime, &root.join(entry));
     let _ = runtime.interp.run_event_loop();
     let output = buffer.borrow().clone();
-    let _ = std::fs::remove_dir_all(&root);
     Outcome {
         output,
         error: result.as_ref().err().map(|error| error.to_string()),
@@ -51,12 +44,11 @@ fn run_commonjs(name: &str, files: &[(&str, &str)], entry: &str) -> Outcome {
 /// Run an ES module, for the cases that interop with CommonJS.
 fn run_module(name: &str, files: &[(&str, &str)], entry: &str) -> Outcome {
     let root = project(name, files);
-    let mut runtime = Runtime::with_root(&root);
+    let mut runtime = Runtime::with_root(root.path());
     let buffer = runtime.capture_output();
     let result = runtime.run_module(&root.join(entry));
     let _ = runtime.interp.run_event_loop();
     let output = buffer.borrow().clone();
-    let _ = std::fs::remove_dir_all(&root);
     Outcome {
         output,
         error: result.as_ref().err().map(|error| error.to_string()),
@@ -447,11 +439,10 @@ fn a_commonjs_file_found_by_extension_order() {
             ("util/index.js", "module.exports = 'from the directory index';"),
         ],
     );
-    let mut runtime = Runtime::with_root(&root);
+    let mut runtime = Runtime::with_root(root.path());
     let buffer = runtime.capture_output();
     let _ = codets::commonjs::run_entry(&mut runtime, &root.join("main.js"));
     assert_eq!(buffer.borrow().trim(), "from the directory index");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A path helper used by the assertions above.

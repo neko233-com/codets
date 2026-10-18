@@ -24,7 +24,7 @@ use std::process::ExitCode;
 
 use crate::builtins::inspect;
 use crate::node::{NodeCompat, Version};
-use crate::versions::{self, VersionSource, VersionStore, VERSION_ENV, VERSION_FILE};
+use crate::versions::{self, VersionSource, VersionStore, VERSION_FILE};
 use crate::{Error, Language, Runtime};
 
 /// What this binary is standing in for.
@@ -81,8 +81,10 @@ pub fn main_as(personality: Personality) -> ExitCode {
     personality.run(args)
 }
 
-/// The marker the version manager's shims pass so that one executable can stand
-/// in for `node` and `npm` under a filename the operating system chose.
+/// The marker a caller can pass to choose a personality by hand.
+///
+/// The store's links are named `codets`, `node` and `npm`, so `argv[0]` is normally
+/// enough; this exists for callers that invoke the binary directly.
 const PERSONALITY_FLAG: &str = "--codets-as=";
 
 /// Pull `--codets-as=node` out of the argument list, if present.
@@ -318,15 +320,28 @@ fn run_node(args: Vec<String>) -> ExitCode {
     }
 }
 
+/// The active Node level and why, for `--version`, `current` and diagnostics.
+fn active(explicit: Option<NodeCompat>) -> (NodeCompat, String) {
+    if let Some(compat) = explicit {
+        return (compat, "from --node-version".to_string());
+    }
+    let store = VersionStore::discover();
+    // A binary that lives inside a version directory pins that level, which is how
+    // `~/.codets/versions/22.12.0/node app.ts` means Node 22.
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(level) = store.level_from_binary_path(&executable) {
+            return (level, VersionSource::BinaryLocation.describe().to_string());
+        }
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let resolution = store.resolve(&cwd);
+    (resolution.node, resolution.source.describe().to_string())
+}
+
 /// The compat level to use: an explicit request, else the version manager's
 /// answer, else the built-in default.
 fn base_compat(explicit: Option<NodeCompat>) -> NodeCompat {
-    if let Some(compat) = explicit {
-        return compat;
-    }
-    let store = VersionStore::discover();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    store.resolve(&cwd).node
+    active(explicit).0
 }
 
 /// `node -c`: parse without running.
@@ -594,13 +609,15 @@ USAGE:
 VERSION MANAGEMENT:
     codets versions                     List installed toolchains and what is available
     codets install <version>            Install a toolchain (18, 20, 22, 24, or a full version)
+    codets bootstrap [--level <v>]      Install the running binary as this machine's toolchain
     codets use <version> [--local]      Switch the active version (--local writes .codets-version)
     codets default <version>            Set the version used when nothing else applies
     codets current                      Print the active version and why it is active
-    codets which                        Print the shim directory
+    codets which                        Print the store's bin directory
     codets env                          Print shell setup for PATH
     codets features                     List the standard-library features the active version has
-    codets upgrade [--from <path>]      Replace the toolchain with another codets build
+    codets upgrade [--to <version>]     Replace the toolchain with a published release
+    codets upgrade --from <path>        ...or with a build you already have
 
 GLOBAL OPTIONS:
     --node-version <version>            Claim a Node release for this run
@@ -654,13 +671,7 @@ fn run_codets(args: Vec<String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         "-v" | "--version" => {
-            let base = base_compat(compat);
-            let store = VersionStore::discover();
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let source = match compat {
-                Some(_) => "from --node-version".to_string(),
-                None => format!("from {}", store.resolve(&cwd).source.describe()),
-            };
+            let (base, source) = active(compat);
             println!(
                 "codets {} — {} ({}; {})",
                 env!("CARGO_PKG_VERSION"),
@@ -708,6 +719,7 @@ fn run_codets(args: Vec<String>) -> ExitCode {
         "npm" => crate::npm::run(tail),
         "versions" => list_versions(),
         "install" => install_version(tail),
+        "bootstrap" => bootstrap(tail, compat),
         "use" => use_version(tail, compat),
         "default" => set_default_version(tail),
         "current" => print_current(),
@@ -735,6 +747,87 @@ fn run_codets(args: Vec<String>) -> ExitCode {
             ExitCode::from(BAD_OPTION)
         }
     }
+}
+
+/// Install the running binary as this machine's toolchain.
+///
+/// This is the step the one-line installers call after unpacking the release
+/// archive. Keeping the store layout here means the shell scripts never have to
+/// know how a version directory is arranged, and the same code is exercised by
+/// the test suite.
+fn bootstrap(args: Vec<String>, explicit: Option<NodeCompat>) -> ExitCode {
+    let mut level = explicit;
+    let mut set_default = true;
+    let mut quiet = false;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        match argument {
+            "--level" | "--node-version" => {
+                index += 1;
+                match args.get(index).and_then(|value| NodeCompat::request(value)) {
+                    Some(compat) => level = Some(compat),
+                    None => {
+                        eprintln!("codets: bootstrap --level needs a Node version");
+                        return ExitCode::from(BAD_OPTION);
+                    }
+                }
+            }
+            "--no-default" => set_default = false,
+            "--quiet" | "-q" => quiet = true,
+            other if other.starts_with("--level=") => {
+                match NodeCompat::request(split_option_value(other).unwrap_or_default()) {
+                    Some(compat) => level = Some(compat),
+                    None => {
+                        eprintln!("codets: bootstrap --level needs a Node version");
+                        return ExitCode::from(BAD_OPTION);
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    let compat = level.unwrap_or_default();
+    let version = compat.version();
+    let store = VersionStore::discover();
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!("codets: cannot find the running executable: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let installed = match store.install_from_labeled(version, &executable, "bootstrap") {
+        Ok(installed) => installed,
+        Err(error) => {
+            eprintln!("codets: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = store.activate(&version) {
+        eprintln!("codets: {error}");
+        return ExitCode::FAILURE;
+    }
+    if set_default {
+        if let Err(error) = store.set_default(&version) {
+            eprintln!("codets: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    if !quiet {
+        println!(
+            "codets {} installed as {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            version,
+            compat.describe()
+        );
+        println!("  toolchain: {}", installed.path.display());
+        println!("  on PATH:   {}", store.bin_dir().display());
+    }
+    ExitCode::SUCCESS
 }
 
 fn list_versions() -> ExitCode {
@@ -769,7 +862,7 @@ fn list_versions() -> ExitCode {
         let installed_marker = installed
             .iter()
             .any(|entry| entry.version.major == *major);
-        let marker = if installed_marker { "installed" } else { "" };
+        let marker = if installed_marker { "   [installed]" } else { "" };
         println!("  {:<10} {}{marker}", compat.version(), compat.describe());
     }
     println!("\nstore: {}", store.root().display());
@@ -848,17 +941,19 @@ fn use_version(args: Vec<String>, explicit: Option<NodeCompat>) -> ExitCode {
             }
         };
     }
-    if let Err(error) = store.set_current(&version) {
-        eprintln!("codets: {error}");
-        return ExitCode::FAILURE;
+    match store.activate(&version) {
+        Ok(linked) => {
+            let compat = explicit.unwrap_or_else(|| NodeCompat::for_major(version.major));
+            println!("now using {version} — {}", compat.describe());
+            for path in linked {
+                println!("  {}", path.display());
+            }
+        }
+        Err(error) => {
+            eprintln!("codets: {error}");
+            return ExitCode::FAILURE;
+        }
     }
-    if let Err(error) = versions::refresh_bin_shims(&store, &version) {
-        eprintln!("codets: {error}");
-        return ExitCode::FAILURE;
-    }
-    let compat = explicit.unwrap_or_else(|| NodeCompat::for_major(version.major));
-    println!("now using {version} — {}", compat.describe());
-    println!("shims: {}", store.bin_dir().display());
     ExitCode::SUCCESS
 }
 
@@ -894,30 +989,21 @@ fn set_default_version(args: Vec<String>) -> ExitCode {
 }
 
 fn print_current() -> ExitCode {
-    let store = VersionStore::discover();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let resolution = store.resolve(&cwd);
-    println!(
-        "{} ({})",
-        resolution.node.v_string(),
-        resolution.source.describe()
-    );
-    if resolution.source == VersionSource::Environment {
-        println!("  set by {VERSION_ENV}");
-    }
+    let (node, source) = active(None);
+    println!("{} ({})", node.v_string(), source);
     ExitCode::SUCCESS
 }
 
 fn print_env() -> ExitCode {
     let store = VersionStore::discover();
     let bin = store.bin_dir();
-    println!("# put the shims first on PATH so `node`, `npm` and `codets` are found");
+    println!("# put the bin directory first on PATH so `node`, `npm` and `codets` are found");
     if cfg!(windows) {
         println!("set PATH={};%PATH%", bin.display());
     } else {
         println!("export PATH=\"{}:$PATH\"", bin.display());
     }
-    println!("# the shim directory is regenerated by `codets use <version>`");
+    println!("# its links follow `codets use <version>`");
     ExitCode::SUCCESS
 }
 
@@ -944,9 +1030,11 @@ fn list_features(explicit: Option<NodeCompat>) -> ExitCode {
 fn upgrade(args: Vec<String>, explicit: Option<NodeCompat>) -> ExitCode {
     let store = VersionStore::discover();
     let mut from: Option<PathBuf> = None;
+    let mut to: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
-        match args[index].as_str() {
+        let argument = args[index].as_str();
+        match argument {
             "--from" => {
                 index += 1;
                 match args.get(index) {
@@ -957,14 +1045,75 @@ fn upgrade(args: Vec<String>, explicit: Option<NodeCompat>) -> ExitCode {
                     }
                 }
             }
+            "--to" => {
+                index += 1;
+                match args.get(index) {
+                    Some(version) => to = Some(version.clone()),
+                    None => {
+                        eprintln!("codets: --to needs a version");
+                        return ExitCode::from(BAD_OPTION);
+                    }
+                }
+            }
             other if other.starts_with("--from=") => {
                 from = Some(PathBuf::from(split_option_value(other).unwrap_or_default()));
             }
+            other if other.starts_with("--to=") => {
+                to = Some(split_option_value(other).unwrap_or_default().to_string());
+            }
+            // A bare version argument is the shorter spelling of `--to`.
+            other if !other.starts_with('-') => to = Some(other.to_string()),
             _ => {}
         }
         index += 1;
     }
 
+    if let Some(source) = from {
+        if !source.is_file() {
+            eprintln!("codets: {} is not a file", source.display());
+            return ExitCode::FAILURE;
+        }
+        let version = match explicit.or_else(|| to.as_deref().and_then(NodeCompat::request)) {
+            Some(compat) => compat.version(),
+            None => match store.current() {
+                Some(version) => version,
+                None => NodeCompat::default().version(),
+            },
+        };
+        let installed = match store.install_from(version, &source) {
+            Ok(installed) => installed,
+            Err(error) => {
+                eprintln!("codets: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return finish_upgrade(&store, installed, &source.display().to_string());
+    }
+
+    // No local build given: take one from the release server.
+    println!(
+        "checking {} for a {} build",
+        crate::release::api_base(),
+        crate::release::target_triple().unwrap_or("supported platform")
+    );
+    let requested = match to.clone() {
+        Some(version) => Some(version),
+        None => explicit.map(|compat| compat.version().to_string()),
+    };
+    let (published, binary) = match crate::release::fetch_binary(requested.as_deref()) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("codets: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if published == env!("CARGO_PKG_VERSION") {
+        println!("already running codets {published}, the newest release");
+        return ExitCode::SUCCESS;
+    }
+    // The published version is the *toolchain* version, not a Node level, so the
+    // level it installs is whatever this process is already using; `--to` on a Node
+    // level is the way to add a new level instead.
     let version = match explicit {
         Some(compat) => compat.version(),
         None => match store.current() {
@@ -972,80 +1121,44 @@ fn upgrade(args: Vec<String>, explicit: Option<NodeCompat>) -> ExitCode {
             None => NodeCompat::default().version(),
         },
     };
-
-    let Some(source) = from else {
-        // Fetching a release needs a network client, which this build does not
-        // carry yet. Say so instead of pretending the upgrade happened.
-        eprintln!(
-            "codets: upgrading from a release server is not implemented in this build.\n\
-             \x20       Use `codets upgrade --from <path-to-codets-binary>` to replace the toolchain\n\
-             \x20       with a build you already have, or `codets install <version>` / `codets use <version>`\n\
-             \x20       to switch between Node compatibility levels."
-        );
-        return ExitCode::FAILURE;
-    };
-
-    if !source.is_file() {
-        eprintln!("codets: {} is not a file", source.display());
-        return ExitCode::FAILURE;
-    }
-    let installed = match store.install(version) {
+    let installed = match store.install_from_bytes(
+        version,
+        &binary,
+        &format!(
+            "{}/{}",
+            crate::release::download_base(),
+            crate::release::asset_name(&published, crate::release::target_triple().unwrap_or(""))
+        ),
+    ) {
         Ok(installed) => installed,
         Err(error) => {
             eprintln!("codets: {error}");
             return ExitCode::FAILURE;
         }
     };
-    // The shims in the version directory should call the new build, not the one
-    // that is running right now, which is what makes this an upgrade.
-    let target = installed.path.join(if cfg!(windows) { "codets.exe" } else { "codets" });
-    if let Err(error) = fs::copy(&source, &target) {
-        eprintln!("codets: cannot copy {} to {}: {error}", source.display(), target.display());
-        return ExitCode::FAILURE;
-    }
-    if let Err(error) = rewrite_shims_for(&installed.path, &target, &installed.version) {
-        eprintln!("codets: {error}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(error) = store.set_current(&installed.version) {
-        eprintln!("codets: {error}");
-        return ExitCode::FAILURE;
-    }
-    println!(
-        "upgraded {} to the build at {}",
-        installed.version,
-        source.display()
-    );
-    ExitCode::SUCCESS
+    println!("downloaded codets {published}");
+    finish_upgrade(&store, installed, &format!("release {published}"))
 }
 
-/// Point a version directory's shims at a specific executable.
-fn rewrite_shims_for(directory: &Path, executable: &Path, version: &Version) -> Result<(), String> {
-    let executable = executable.to_string_lossy().to_string();
-    for command in ["codets", "node", "npm"] {
-        let names = if cfg!(windows) {
-            vec![format!("{command}.cmd")]
-        } else {
-            vec![command.to_string()]
-        };
-        let mut flags = vec![format!("--node-version={version}")];
-        if command != "codets" {
-            flags.push(format!("--codets-as={command}"));
+/// Make a freshly installed toolchain the active one and report it.
+fn finish_upgrade(
+    store: &VersionStore,
+    installed: crate::versions::InstalledVersion,
+    source: &str,
+) -> ExitCode {
+    match store.activate(&installed.version) {
+        Ok(_) => {
+            println!(
+                "now using {} ({}), installed from {source}",
+                installed.version,
+                installed.node.describe()
+            );
+            println!("  {}", installed.path.display());
+            ExitCode::SUCCESS
         }
-        for name in names {
-            let path = directory.join(name);
-            let quoted = flags
-                .iter()
-                .map(|flag| format!("\"{flag}\""))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let body = if cfg!(windows) {
-                format!("@echo off\r\n\"{executable}\" {quoted} %*\r\n")
-            } else {
-                format!("#!/bin/sh\nexec \"{executable}\" {quoted} \"$@\"\n")
-            };
-            fs::write(&path, body).map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        Err(error) => {
+            eprintln!("codets: {error}");
+            ExitCode::FAILURE
         }
     }
-    Ok(())
 }

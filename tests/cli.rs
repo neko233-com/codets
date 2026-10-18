@@ -8,6 +8,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
+use support::Scratch;
+
 /// The `node` personality, run through the `node` binary.
 fn node(args: &[&str]) -> Output {
     run(bin("node"), args, None)
@@ -31,57 +35,49 @@ fn bin(name: &str) -> PathBuf {
     })
 }
 
-/// A scratch directory that lives as long as the test.
-fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("codets-cli-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).expect("scratch directory");
-    path
+/// A scratch directory for one test, removed when the test ends — including when it
+/// panics, which the trailing `remove_dir_all` this replaces did not manage.
+fn scratch(name: &str) -> Scratch {
+    Scratch::new(name)
 }
 
-fn run(program: PathBuf, args: &[&str], home: Option<&PathBuf>) -> Output {
-    run_in(program, args, home, &sandbox())
+fn run(program: PathBuf, args: &[&str], home: Option<&Path>) -> Output {
+    run_in(program, args, home, None)
 }
 
-/// A clean working directory for every command.
+/// Run a binary with a chosen version store and working directory.
 ///
-/// The version manager walks up from the working directory looking for a
-/// `.codets-version` pin, so running the binaries from a controlled directory is
-/// what keeps these tests independent of whatever is around the repository.
-fn sandbox() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("codets-cli-cwd-{}", std::process::id()));
-    std::fs::create_dir_all(&path).expect("sandbox directory");
-    path
-}
-
-/// The version store for tests that need one but do not care which.
-///
-/// The path carries the process id, so a previous run's state can never be read
-/// back and a test never depends on its neighbours or on the order they ran in.
-fn default_home() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("codets-cli-nohome-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&path);
-    path
-}
-
-fn run_in(program: PathBuf, args: &[&str], home: Option<&PathBuf>, cwd: &Path) -> Output {
+/// Both are created when the caller does not name one, and removed when the call
+/// returns. A clean working directory matters on its own: the version manager walks
+/// up from it looking for a `.codets-version` pin, so a controlled directory is what
+/// keeps these tests independent of whatever is around the repository.
+fn run_in(program: PathBuf, args: &[&str], home: Option<&Path>, cwd: Option<&Path>) -> Output {
+    let own_home = Scratch::new("home");
+    let own_cwd = Scratch::new("cwd");
+    let home = home.unwrap_or_else(|| own_home.path());
+    let cwd = cwd.unwrap_or_else(|| own_cwd.path());
     let mut command = Command::new(program);
-    command.args(args).current_dir(cwd);
-    match home {
-        Some(home) => command.env("CODETS_HOME", home),
-        None => command.env("CODETS_HOME", default_home()),
-    };
+    command.args(args).current_dir(cwd).env("CODETS_HOME", home);
     command.env_remove("CODETS_NODE_VERSION");
     command.output().expect("running the toolchain")
 }
 
 /// The `codets` toolchain against a specific version store.
 fn codets_with_home(args: &[&str], home: &Path) -> Output {
-    run_in(bin("codets"), args, Some(&home.to_path_buf()), &sandbox())
+    run_in(bin("codets"), args, Some(home), None)
 }
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// The file name a command has in a directory on this platform.
+fn command_file(directory: &Path, command: &str) -> PathBuf {
+    if cfg!(windows) {
+        directory.join(format!("{command}.exe"))
+    } else {
+        directory.join(command)
+    }
 }
 
 fn stderr(output: &Output) -> String {
@@ -156,7 +152,6 @@ fn position_arguments_reach_the_script() {
     let output = node(&[script.to_string_lossy().as_ref(), "one", "two"]);
     // `console.log` separates its arguments with a space.
     assert_eq!(stdout(&output), "one,two args.ts");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -201,7 +196,6 @@ fn check_reports_syntax_errors_without_running() {
 
     let broken = node(&["--check", bad.to_string_lossy().as_ref()]);
     assert_eq!(broken.status.code(), Some(1));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -239,15 +233,50 @@ fn the_version_manager_installs_and_switches() {
     let reported = run(bin("node"), &["-p", "process.version"], Some(&home));
     assert_eq!(stdout(&reported), "v22.12.0");
 
-    // Shims are written for all three command names.
+    // `bin/` holds the three commands, linked to the active toolchain.
     for name in ["codets", "node", "npm"] {
-        let shim = if cfg!(windows) {
-            home.join("bin").join(format!("{name}.cmd"))
-        } else {
-            home.join("bin").join(name)
-        };
-        assert!(shim.is_file(), "missing shim {}", shim.display());
+        let linked = command_file(&home.join("bin"), name);
+        assert!(linked.is_file(), "missing {}", linked.display());
     }
+    // `versions/<v>/node` pins that level, so those commands exist as well.
+    for name in ["codets", "node", "npm"] {
+        let linked = command_file(&home.join("versions").join("22.12.0"), name);
+        assert!(linked.is_file(), "missing {}", linked.display());
+    }
+    // Running the linked `node` directly reports the active level.
+    let linked_node = command_file(&home.join("bin"), "node");
+    let reported_by_link = Command::new(&linked_node)
+        .args(["-p", "process.version"])
+        .env("CODETS_HOME", home.path())
+        .env_remove("CODETS_NODE_VERSION")
+        .output()
+        .expect("run the linked node");
+    assert_eq!(
+        String::from_utf8_lossy(&reported_by_link.stdout).trim(),
+        "v22.12.0"
+    );
+    // Installing another level must not move `node` off the active one.
+    let other = codets_with_home(&["install", "18"], &home);
+    assert_eq!(other.status.code(), Some(0), "{}", stderr(&other));
+    let still_active = codets_with_home(&["current"], &home);
+    assert!(
+        stdout(&still_active).contains("22.12.0"),
+        "installing a level changed the active version: {}",
+        stdout(&still_active)
+    );
+    // ...and a binary inside that level's directory pins it, whatever `current`
+    // says, which is what `versions/<v>/node` is for.
+    let pinned = command_file(&home.join("versions").join("18.20.4"), "node");
+    let reported_by_pinned = Command::new(&pinned)
+        .args(["-p", "process.version"])
+        .env("CODETS_HOME", home.path())
+        .env_remove("CODETS_NODE_VERSION")
+        .output()
+        .expect("run the pinned node");
+    assert_eq!(
+        String::from_utf8_lossy(&reported_by_pinned.stdout).trim(),
+        "v18.20.4"
+    );
 
     // An explicit `--node-version` still overrides the manager.
     let overridden = run(bin("node"), &["--node-version=24", "-p", "process.version"], Some(&home));
@@ -263,7 +292,6 @@ fn the_version_manager_installs_and_switches() {
         stdout(&old)
     );
 
-    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -272,10 +300,10 @@ fn a_project_pin_beats_the_active_version() {
     let project = home.join("project");
     std::fs::create_dir_all(&project).expect("project");
 
-    run_in(bin("codets"), &["use", "24"], Some(&home), &project);
+    run_in(bin("codets"), &["use", "24"], Some(&home), Some(&project));
     // `--local` writes the pin into the working directory, which is why the test
     // pins a scratch directory rather than wherever the test binary runs.
-    let pinned = run_in(bin("codets"), &["use", "22", "--local"], Some(&home), &project);
+    let pinned = run_in(bin("codets"), &["use", "22", "--local"], Some(&home), Some(&project));
     assert_eq!(pinned.status.code(), Some(0));
     assert!(
         project.join(".codets-version").is_file(),
@@ -288,11 +316,9 @@ fn a_project_pin_beats_the_active_version() {
         bin("node"),
         &["-p", "process.version"],
         Some(&home),
-        &project.join("..").join("project"),
+        Some(&project),
     );
     assert_eq!(stdout(&output), "v22.12.0");
-
-    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -333,4 +359,176 @@ fn the_node_binary_can_also_be_reached_through_codets() {
     let delegated = codets(&["node", "-p", "40 + 2"]);
     assert_eq!(stdout(&direct), "42");
     assert_eq!(stdout(&delegated), "42");
+}
+
+/// Run `npm` in `dir` with a controlled user config.
+///
+/// The machine running the tests may have its own `~/.npmrc`, so every registry
+/// test points the user config at a file inside the test's directory: a missing
+/// file is a valid answer, and the assertion then depends only on what the test
+/// set up.
+fn npm_here(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let home = Scratch::new("npm-home");
+    let mut command = Command::new(bin("npm"));
+    command.args(args).current_dir(dir);
+    command.env("CODETS_HOME", home.path());
+    command.env_remove("CODETS_NODE_VERSION");
+    command.env_remove("NPM_CONFIG_REGISTRY");
+    command.env_remove("npm_config_registry");
+    command.env("NPM_CONFIG_USERCONFIG", dir.join("no-such-user-npmrc"));
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("running npm")
+}
+
+fn write_npmrc(dir: &Path, registry: &str) {
+    std::fs::write(dir.join(".npmrc"), format!("registry={registry}\n")).expect("npmrc");
+}
+
+#[test]
+fn npm_config_get_registry_follows_the_chain() {
+    let dir = scratch("npm-config");
+
+    // Nothing configured anywhere reaches npm's own registry.
+    let plain = npm_here(&dir, &["config", "get", "registry"], &[]);
+    assert_eq!(plain.status.code(), Some(0), "{}", stderr(&plain));
+    assert_eq!(stdout(&plain), "https://registry.npmjs.org");
+
+    // The environment beats the files.
+    let from_env = npm_here(
+        &dir,
+        &["config", "get", "registry"],
+        &[("NPM_CONFIG_REGISTRY", "https://env.example.com/")],
+    );
+    assert_eq!(stdout(&from_env), "https://env.example.com/");
+
+    // A project `.npmrc` is next, and npm's lowercase spelling works too.
+    write_npmrc(&dir, "https://project.example.com/");
+    let from_file = npm_here(&dir, &["config", "get", "registry"], &[]);
+    assert_eq!(stdout(&from_file), "https://project.example.com/");
+
+    let lowercase = npm_here(
+        &dir,
+        &["config", "get", "registry"],
+        &[("npm_config_registry", "https://lower.example.com/")],
+    );
+    assert_eq!(stdout(&lowercase), "https://lower.example.com/");
+
+    // A flag beats everything.
+    let from_flag = npm_here(
+        &dir,
+        &["config", "get", "registry", "--registry", "https://flag.example.com/"],
+        &[("NPM_CONFIG_REGISTRY", "https://env.example.com/")],
+    );
+    assert_eq!(stdout(&from_flag), "https://flag.example.com/");
+
+}
+
+#[test]
+fn npm_config_get_registry_keeps_stdout_parseable() {
+    let dir = scratch("npm-config-origin");
+    write_npmrc(&dir, "https://project.example.com/");
+
+    let quiet = npm_here(&dir, &["config", "get", "registry"], &[]);
+    assert_eq!(stdout(&quiet), "https://project.example.com/");
+
+    // Where the setting came from is opt-in and goes to stderr, so a script that
+    // pipes stdout still sees a bare value.
+    let loud = npm_here(&dir, &["config", "get", "registry", "--origin"], &[]);
+    assert_eq!(stdout(&loud), "https://project.example.com/");
+    assert!(stderr(&loud).contains(".npmrc"), "{}", stderr(&loud));
+    assert!(stderr(&loud).contains("https://project.example.com/"), "{}", stderr(&loud));
+
+}
+
+#[test]
+fn npm_config_get_refuses_a_key_it_does_not_implement() {
+    // Saying so is better than printing nothing and letting a script believe it.
+    let output = npm(&["config", "get", "strict-ssl"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("knows only `registry`"), "{}", stderr(&output));
+}
+
+#[test]
+fn npm_install_uses_the_registry_a_project_configures() {
+    // The whole point of the chain: a project pointing at a local registry installs
+    // from it, with no flag on the command line. The registry is a directory, which
+    // is the offline backend the installer tests use.
+    let dir = scratch("npm-config-install");
+    let registry = dir.join("registry");
+    // The directory backend keeps each version in its own directory, which is what
+    // makes it readable in a fixture.
+    let package = registry.join("local-only").join("1.0.0");
+    std::fs::create_dir_all(&package).expect("registry");
+    std::fs::write(
+        package.join("package.json"),
+        "{ \"name\": \"local-only\", \"version\": \"1.0.0\", \"main\": \"index.js\" }",
+    )
+    .expect("manifest");
+    std::fs::write(package.join("index.js"), "module.exports = 'from the local registry';")
+        .expect("module");
+    std::fs::write(
+        registry.join("local-only.json"),
+        "{ \"name\": \"local-only\", \"versions\": { \"1.0.0\": { \"dist\": { \"tarball\": \"local-only/1.0.0.tgz\" } } } }",
+    )
+    .expect("packument");
+
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::write(
+        project.join("package.json"),
+        "{ \"name\": \"consumer\", \"version\": \"1.0.0\", \"dependencies\": { \"local-only\": \"^1.0.0\" } }",
+    )
+    .expect("manifest");
+    write_npmrc(&project, &registry.to_string_lossy());
+
+    let output = npm_here(&project, &["install"], &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        project.join("node_modules").join("local-only").join("index.js").is_file(),
+        "the project's own registry was not used: {}",
+        stdout(&output)
+    );
+
+}
+
+#[test]
+fn env_and_versions_describe_the_store_accurately() {
+    let home = scratch("store-output");
+    let installed = codets_with_home(&["install", "22"], &home);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr(&installed));
+
+    // `codets env` names the directory that belongs on PATH, and says what happens to
+    // it. It holds links now rather than the shim scripts this used to write, and the
+    // output is pasted into shell profiles, so the wording is worth a test.
+    let env = codets_with_home(&["env"], &home);
+    let text = stdout(&env);
+    assert!(text.contains("bin directory"), "{text}");
+    assert!(!text.contains("shim"), "stale wording in `codets env`: {text}");
+
+    // A level that is installed is marked as such, and the marker cannot run into the
+    // description: `... (Krypton)installed` is what a missing separator looks like.
+    let versions = codets_with_home(&["versions"], &home);
+    let text = stdout(&versions);
+    assert!(text.contains("[installed]"), "{text}");
+    assert!(!text.contains(")installed"), "a marker ran into the description: {text}");
+}
+
+#[test]
+fn bootstrap_does_not_record_a_path_that_will_be_gone() {
+    let home = scratch("bootstrap-source");
+    let bootstrapped = codets_with_home(&["bootstrap", "--level", "22"], &home);
+    assert_eq!(bootstrapped.status.code(), Some(0), "{}", stderr(&bootstrapped));
+
+    let manifest = std::fs::read_to_string(home.join("versions").join("22.12.0").join("toolchain.conf"))
+        .expect("the manifest");
+    assert!(manifest.contains("source=bootstrap"), "{manifest}");
+    // The binary that ran is the test build. Recording that path would put a path in
+    // the manifest that an installed toolchain never had, and would make two identical
+    // installs differ — which is what an installer would produce, every time.
+    assert!(
+        !manifest.contains("target"),
+        "the manifest records where the test binary happened to live: {manifest}"
+    );
 }
