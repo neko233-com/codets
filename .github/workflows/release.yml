@@ -145,7 +145,23 @@ jobs:
           # readme alongside the binary.
           cp README.md LICENSE "dist/$stage/"
           tar -C dist -czf "dist/${stage}.tar.gz" "$stage"
-          digest="$(sha256sum "dist/${stage}.tar.gz" | cut -d' ' -f1)"
+          # `sha256sum` is coreutils, which macOS does not ship — it has `shasum`,
+          # and `openssl` is the last resort. Using `sha256sum` unconditionally
+          # failed the macOS jobs after they had already built the binary.
+          digest_of() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | cut -d' ' -f1
+            elif command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "$1" | cut -d' ' -f1
+            else
+              openssl dgst -sha256 "$1" | sed 's/.*= *//'
+            fi
+          }
+          digest="$(digest_of "dist/${stage}.tar.gz")"
+          if [ "${#digest}" -ne 64 ]; then
+            echo "::error::no sha256 for ${stage}.tar.gz, got \`$digest\`"
+            exit 1
+          fi
           # `<hex>  <name>`, the format `release::verify_checksum` parses.
           printf '%s  %s\n' "$digest" "${stage}.tar.gz" > "dist/checksum-${TARGET}.txt"
           cat "dist/checksum-${TARGET}.txt"
