@@ -1,30 +1,50 @@
 [package]
-name = "rust4ts"
-version = "0.1.0"
+name = "codets"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
-description = "A pure-Rust JavaScript & TypeScript engine with native TypeScript support. Run ESM .ts/.js plugins inside your Rust app with no C toolchain and no Node.js."
+description = "codets: a pure-Rust JavaScript & TypeScript toolchain that replaces Node.js and npm, with native TypeScript support."
 license = "MIT"
-repository = "https://github.com/neko233-com/rust4ts"
-homepage = "https://github.com/neko233-com/rust4ts"
-documentation = "https://docs.rs/rust4ts"
+repository = "https://github.com/neko233-com/codets"
+homepage = "https://github.com/neko233-com/codets"
+documentation = "https://docs.rs/codets"
 readme = "README.md"
-keywords = ["javascript", "typescript", "interpreter", "runtime", "scripting"]
-categories = ["development-tools", "compilers", "web-programming"]
+keywords = ["javascript", "typescript", "nodejs", "runtime", "interpreter"]
+categories = ["development-tools", "compilers", "command-line-utilities"]
 exclude = ["/.github/**", "/.codely-cli/**", "/CODELY.md"]
 
 [lib]
-name = "rust4ts"
+name = "codets"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rust4ts"
+name = "codets"
 path = "src/main.rs"
+
+[[bin]]
+name = "node"
+path = "src/bin/node.rs"
+
+[[bin]]
+name = "npm"
+path = "src/bin/npm.rs"
 
 [dependencies]
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
+
+# The package manager. Every dependency below is pure Rust, so building codets
+# still needs no C toolchain; TLS comes from the platform through native-tls.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+sha2 = "0.10"
+tar = "0.4"
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+# Installing packages is the parallel workload, so the reproducible
+# single-threaded comparison in the benchmarks needs a way to disable threads.
+[features]
+default = []

@@ -1182,6 +1182,26 @@ fn install_string(interp: &mut Interp) {
         Ok(Value::str(text))
     });
 
+    // `String.raw` is the tagged-template helper. Tagged templates already hand
+    // the tag a `raw` array, so this only has to interleave the substitutions.
+    if let Value::Object(string_fn) = &constructor {
+        def(&*interp, string_fn, "raw", 1, |interp, _this, args| {
+            let strings = arg(args, 0);
+            let raw = interp.get_prop(&strings, "raw")?;
+            let pieces = interp.array_items(if raw.is_nullish() { &strings } else { &raw })?;
+            let mut out = String::new();
+            for (index, piece) in pieces.iter().enumerate() {
+                out.push_str(&piece.to_display_string());
+                if index + 1 < pieces.len() {
+                    if let Some(substitution) = args.get(index + 1) {
+                        out.push_str(&substitution.to_display_string());
+                    }
+                }
+            }
+            Ok(Value::str(out))
+        });
+    }
+
     interp.define_global("String", constructor);
 }
 
@@ -1273,6 +1293,12 @@ fn install_number_and_boolean(interp: &mut Interp) {
         });
         def(&*interp, number_fn, "isNaN", 1, |_interp, _this, args| {
             Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.is_nan())))
+        });
+        def(&*interp, number_fn, "isSafeInteger", 1, |_interp, _this, args| {
+            Ok(Value::Bool(match arg(args, 0) {
+                Value::Num(n) => n.is_finite() && n.fract() == 0.0 && n.abs() <= 9007199254740991.0,
+                _ => false,
+            }))
         });
         number_fn
             .borrow_mut()
@@ -1467,7 +1493,7 @@ fn install_json(interp: &mut Interp) {
 }
 
 /// Convert the neutral JSON tree into interpreter values.
-fn materialise(interp: &mut Interp, value: json::Raw) -> Result<Value, Control> {
+pub(crate) fn materialise(interp: &mut Interp, value: json::Raw) -> Result<Value, Control> {
     Ok(match value {
         json::Raw::Null => Value::Null,
         json::Raw::Bool(b) => Value::Bool(b),
@@ -2348,6 +2374,23 @@ fn install_globals(interp: &mut Interp) {
         }),
     );
 
+    // `Number.parseInt` and `Number.parseFloat` are the same functions as the
+    // globals, so they are attached here rather than implemented twice.
+    let number_constructor = interp
+        .global_object
+        .borrow()
+        .props
+        .get("Number")
+        .cloned();
+    if let Some(Value::Object(number)) = number_constructor {
+        for name in ["parseInt", "parseFloat"] {
+            let function = interp.global_object.borrow().props.get(name).cloned();
+            if let Some(function) = function {
+                number.borrow_mut().props.set(name, function);
+            }
+        }
+    }
+
     // `print` writes a plain line, which is handy for examples.
     interp.define_global(
         "print",
@@ -2605,6 +2648,7 @@ pub mod json {
     use super::*;
 
     /// The neutral tree produced by [`parse`], before values are materialised.
+    #[derive(Clone)]
     pub enum Raw {
         Null,
         Bool(bool),
@@ -2614,8 +2658,23 @@ pub mod json {
         Object(Vec<(String, Raw)>),
     }
 
+    impl Raw {
+        /// The entries when this is a JSON object.
+        pub fn as_object(&self) -> Option<&Vec<(String, Raw)>> {
+            match self {
+                Raw::Object(entries) => Some(entries),
+                _ => None,
+            }
+        }
+    }
+
     /// Parse JSON text. Returns `None` on malformed input.
+    ///
+    /// A leading byte-order mark is skipped, which is what Node's own JSON
+    /// readers do: a `package.json` saved by a Windows editor often starts with
+    /// one, and rejecting it would be a compatibility bug, not strictness.
     pub fn parse(text: &str) -> Option<Raw> {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let chars: Vec<char> = text.chars().collect();
         let mut parser = JsonParser { chars, pos: 0 };
         parser.skip_whitespace();

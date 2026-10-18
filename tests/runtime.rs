@@ -3,8 +3,8 @@
 
 use std::path::PathBuf;
 
-use rust4ts::value::Value;
-use rust4ts::{Error, Language, Runtime};
+use codets::value::Value;
+use codets::{Error, Language, Runtime};
 
 /// Run a TypeScript snippet and return what it printed.
 fn run(source: &str) -> String {

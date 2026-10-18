@@ -1,0 +1,13 @@
+{
+  "name": "greeter",
+  "versions": {
+    "1.0.0": {
+      "dist": { "tarball": "greeter-1.0.0.tgz" },
+      "dependencies": {}
+    },
+    "1.1.0": {
+      "dist": { "tarball": "greeter-1.1.0.tgz" },
+      "dependencies": { "shout": "^2.0.0" }
+    }
+  }
+}

@@ -1,58 +1,49 @@
-# rust4ts
+# codets
 
-A **pure-Rust JavaScript & TypeScript engine with native TypeScript support**.
-Embed a JS/TS runtime in your Rust application — no C toolchain, no V8, no
-Node.js.
+A **pure-Rust JavaScript & TypeScript toolchain** that replaces Node.js and npm.
 
-```bash
-cargo add rust4ts
-```
+One build produces three commands, so `node`, `npm` and `codets` on your `PATH` are
+the same program wearing three hats:
 
-```rust
-use rust4ts::{Language, Runtime};
+| Command | Stands in for | What it does |
+|---|---|---|
+| `codets` | a new toolchain | Runs code, manages the installed Node compatibility levels |
+| `node` | `node` | Runs scripts with Node's flags, globals and exit codes |
+| `npm` | `npm` | Resolves, downloads, verifies and unpacks packages |
 
-let mut runtime = Runtime::new();
-runtime.echo_to_stdout();
-runtime.eval(
-    "enum Color { Red, Green = 5 }\n\
-     const label = (c: Color): string => `color ${c}`;\n\
-     console.log(Color[5], label(Color.Green));",
-    Language::Ts,
-)?;
-// prints: Green color 5
-```
-
-Or from the command line:
+TypeScript runs directly — there is no build step, no `ts-node`, no transpiler in
+the way. It is not Node.js under the hood: the engine, the module loaders, the
+standard library and the package manager are all original Rust, and the only
+native code involved is the platform's own TLS stack.
 
 ```bash
-rust4ts plugin.ts        # run a module, resolving relative imports
-rust4ts eval "console.log([1,2,3].map(n => n * 2).join(','))"
+codets app.ts                    # run TypeScript
+node app.js                      # Node-compatible entry point
+npm install                      # install dependencies
+codets use 22                    # switch the Node compatibility level
 ```
 
-## Why another JavaScript engine?
+## Status
 
-Because every existing embedding option costs you something a Rust crate should
-not cost:
+This is an early but real implementation, and the numbers below were produced by
+the commands in this repository rather than estimated:
 
-| | `rust4ts` | `rquickjs` / QuickJS | `deno_core` / V8 |
-|---|---|---|---|
-| C/C++ toolchain required | **no** | yes | yes |
-| Cross-compilation | **plain `cargo build`** | needs a C cross-compiler | needs a V8 toolchain |
-| Binary size | **small** | ~1 MB | tens of MB |
-| Language | **native TypeScript** | transpile first | transpile first |
-| Executes npm packages | no | no | mostly yes |
-| Speed | slow | fast | fastest |
+| | |
+|---|---|
+| Tests | **146 automated tests, all passing** (`cargo test`) |
+| Real npm registry install | verified: `npm install` fetched `is-odd@3.0.1` and its transitive `is-number` from `registry.npmjs.org`, and `node index.js` ran the program |
+| Parallel install throughput | **5.34×** faster with 8 workers than 1 (24 packages, 41.8 MiB unpacked, identical trees) — `scripts/bench-npm-install.ps1` |
+| JavaScript throughput baseline | ~2.2M simple loop iterations/second (`bench-npm-install.ps1`, debug build) |
 
-`rust4ts` is a from-scratch tree-walking interpreter written in 100% Rust. Its
-only dependency is the pure-Rust [`regex`](https://crates.io/crates/regex)
-crate. It targets **your own plugin and application code**, not the npm
-ecosystem — see [Limits](#limits-read-this-first).
+Read [Limits](#limits-read-this-before-trusting-it) before trusting it with
+anything that matters. In particular: native addons do not work, and the
+JavaScript engine is a tree-walking interpreter, so it is far slower than V8.
 
 ## Native TypeScript
 
-There is no transpile step and no `.d.ts` pipeline. The parser understands
-TypeScript directly and erases types while building the AST, so nothing about
-types survives into the runtime.
+No transpile step, no `.d.ts` pipeline. The parser understands TypeScript directly
+and erases types while building the AST, so nothing about types survives into the
+runtime — the same strategy Node itself uses for type stripping.
 
 | Construct | What happens |
 |---|---|
@@ -66,133 +57,300 @@ types survives into the runtime.
 | `enum` / `const enum` | **kept**: real object plus reverse mapping for numbers |
 | `constructor(private x: number)` | **kept**: injects `this.x = x` |
 
-`enum` and parameter properties are the only two TypeScript constructs with
-runtime meaning, so they are the only two that survive.
+`enum` and parameter properties are the only two TypeScript constructs with runtime
+meaning, so they are the only two that survive.
 
-Type-only imports and exports produce no code, so a module that exports only
-types still loads.
+## Node compatibility levels
 
-## Embedding it in a host application
+`codets` claims to be a specific Node.js release. That release decides what
+`process.version` reports and which standard-library features exist, so a package
+that branches on the Node version takes the branch it would take on real Node.
 
-```rust
-use rust4ts::value::Value;
-use rust4ts::{Language, Runtime};
-
-let mut runtime = Runtime::with_root("./plugins");
-
-// Expose Rust functions to scripts.
-runtime.register_fn("log", |runtime, _this, args| {
-    let line: Vec<String> = args.iter().map(|v| v.to_display_string()).collect();
-    runtime.print_line(&line.join(" "));
-    Ok(Value::Undefined)
-});
-
-// Run a plugin and inspect its exports.
-let exports = runtime.run_module(std::path::Path::new("./plugins/hello.ts"))?;
-let _default = runtime.interp.get_prop(&exports, "default")?;
+```console
+$ node --node-version=18 -p "typeof Object.groupBy"
+undefined
+$ node --node-version=24 -p "typeof Object.groupBy"
+function
 ```
 
-`Runtime::eval` runs a script in the global scope, `Runtime::run_module` loads an
-ES module from disk and returns its namespace object, `ModuleLoader::clear_cache`
-lets a host pick up edited plugin files.
+Supported lines: **18, 20, 21, 22, 23, 24** (the default is 24 LTS, `Krypton`).
+`codets features` lists what the active level provides and, for the ones it does
+not, the Node release that would.
 
-## CLI
+Each gated feature is really implemented, not merely advertised:
 
+| Feature | Node | What it installs |
+|---|---|---|
+| `Object.hasOwn` | 16 | the static method |
+| `structuredClone` | 17 | a deep clone, with cycle support |
+| `toSorted` / `toReversed` / `toSpliced` / `with`, `isWellFormed` / `toWellFormed` | 20 | the copy-on-write array methods |
+| `Object.groupBy` | 21 | grouping into arrays |
+| `Promise.withResolvers` | 22 | promise plus its resolvers |
+| `Set.prototype.union` and friends | 22 | all seven set operations |
+| `Error.isError` | 24 | the static check |
+| `RegExp.escape` | 24 | pattern escaping |
+| `Math.sumPrecise` | 24 | Neumaier summation |
+
+## The version manager
+
+`codets` manages its own toolchains the way `rustup` and `fnm` do, so a project can
+pin the Node release it targets and switch in one command.
+
+```console
+$ codets install 22                 # materialise the 22 LTS toolchain
+$ codets use 22                     # make it active for this machine
+$ codets use 22 --local             # ...or pin it for this project only
+$ codets current                    # what is active, and why
+$ codets versions                   # installed and available
+$ codets env                        # PATH setup for the shims
 ```
-rust4ts <file.ts|file.js>     Run a module
-rust4ts eval "<code>"         Evaluate a snippet
-rust4ts --version | --help
+
+Resolution order for the active version, first match wins:
+
+1. `$CODETS_NODE_VERSION`
+2. the nearest `.codets-version` file, walking up from the working directory
+3. the `current` pointer (`codets use`)
+4. `default` in the store's settings (`codets default`)
+5. the built-in default
+
+The store lives in `~/.codets` (or `$CODETS_HOME`):
+
+```text
+~/.codets/
+  bin/                     shims to put on PATH: codets, node, npm
+  versions/22.12.0/        one toolchain: manifest plus its own shims
+  current                  the active version
+  settings.conf            `default=<version>`
 ```
 
-Uncaught errors go to stderr and set exit code 1.
+Installing a version materialises its directory and shims, which needs no network.
+Fetching a *newer* `codets` build is the only step that would, and
+`codets upgrade --from <path>` does that from a build you already have.
+`codets upgrade` without `--from` says plainly that it is not implemented in this
+build rather than pretending otherwise.
+
+## The package manager
+
+`npm install` implements npm's own file formats, so a project installed by npm can
+be installed by `codets` and the other way round.
+
+* **Resolution** — `^`, `~`, `>=`, `<`, `x`, `||` and intersections, with
+  pre-release rules. Each package name is resolved once against every range
+  requested for it.
+* **Registries** — the npm registry protocol over HTTPS, or a directory on disk
+  that holds packuments and tarballs (which is how the tests run offline).
+* **Integrity** — `sha512` digests are verified before anything is written.
+* **Unpacking** — gunzip and untar, with the archive's leading `package/`
+  directory stripped and escaping paths rejected.
+* **Binaries** — every declared `bin` gets a shim in `node_modules/.bin`.
+* **Lockfile** — `package-lock.json` is written in version 3's shape.
+* **Scripts** — `npm run <script>` runs with `node_modules/.bin` on `PATH` and
+  npm's lifecycle variables set. `npm exec`, `npm list` and `npm init` work too.
+
+### Where the parallelism lives
+
+JavaScript execution is single-threaded, because the language is. The parallelism
+is in the installer, where it actually pays: metadata resolution, then download,
+verification and unpacking of every package at once, on as many workers as you ask
+for.
+
+```console
+$ npm install --jobs 8
+added 24 packages in 0.04s (transfer 0.03s on 8 threads, 41.8 MiB)
+$ npm install --jobs 1
+added 24 packages in 0.24s (transfer 0.23s on 1 threads, 41.8 MiB)
+```
+
+Reproduce that with `scripts/bench-npm-install.ps1`, which builds a local registry
+of real gzipped tarballs and reports both runs plus the speed-up. Both runs are
+checked to produce identical trees, so the comparison is meaningful.
 
 ## What works
 
-* **Language**: closures and lexical scoping, `var`/`let`/`const`, destructuring
-  (nested, defaults, rest), spread, template literals, tagged templates,
+* **Language** — closures and lexical scoping, `var`/`let`/`const`, destructuring
+  (nested, defaults, rest), spread, template literals and tagged templates,
   optional chaining and `??`, `typeof`/`instanceof`/`in`/`delete`, labelled
   `break`/`continue`, `switch`, `try`/`catch`/`finally`, `for`/`for-in`/`for-of`,
   classes with `extends`/`super`/`static`/getters/setters/fields/static blocks.
-* **Modules**: ES modules only, with correct dependency-first evaluation and
-  import cycles that terminate. `import.meta` is available.
-* **Built-ins**: `Object`, `Array`, `String`, `Number`, `Boolean`, `Math`,
-  `JSON`, `Date` (basic), `RegExp`, `Map`, `Set`, `Promise`, the `Error` family,
-  `console`, `parseInt`/`parseFloat`, `setTimeout`/`setInterval` on a virtual
-  clock.
-* **Async**: `async`/`await` and promise reactions, microtasks before timers.
+* **Modules** — ES modules with dependency-first evaluation, import cycles,
+  `import.meta`, and **CommonJS**: `require`, `module`, `exports`, `__filename`,
+  `__dirname`, the `node_modules` walk, `package.json` `exports` and `main`,
+  `require.resolve`, JSON modules. `import` of a CommonJS package works through
+  Node-style interop (`module.exports` as `default`, its properties as named
+  exports).
+* **Core modules** — `path`, `fs` (synchronous subset), `os`, `events`
+  (including `class X extends EventEmitter`), `util` (including `promisify`),
+  `assert`, `querystring`, `buffer`, `timers`, `module` (including
+  `createRequire`), `process`, all with or without the `node:` prefix.
+* **`process`** — `argv`, `argv0`, `execPath`, `execArgv`, `version`, `versions`,
+  `platform`, `arch`, `pid`, `env`, `cwd`, `chdir`, `exit`, `exitCode`, `stdout`,
+  `stderr`, `nextTick`, `hrtime`, `uptime`, `memoryUsage`, `release`, `features`,
+  and enough of the event emitter for `process.on('exit')` and
+  `process.on('uncaughtException')` to work.
+* **Built-ins** — `Object`, `Array`, `String`, `Number`, `Boolean`, `Math`,
+  `JSON`, `Date`, `RegExp`, `Map`, `Set`, `Promise`, the `Error` family,
+  `console`, `parseInt`/`parseFloat`, `structuredClone`, `setTimeout` and friends
+  on a virtual clock, with microtasks before timers.
+* **Async** — `async`/`await` and promise reactions.
 
-## Limits (read this first)
+## Limits (read this before trusting it)
 
-These are deliberate, documented boundaries rather than bugs:
+These are boundaries, not bugs, and each one is a deliberate stopping point rather
+than an oversight:
 
-* **No npm.** Bare specifiers such as `import x from "lodash"` are rejected with
-  an explanatory error; only relative and absolute paths resolve. There is no
-  `node_modules` lookup and no CommonJS `require`.
+**Nothing that needs V8.**
+
+* **Native addons do not work.** A `.node` file binds V8's ABI, which a pure-Rust
+  engine does not expose. `require('binding.node')` fails with an explanation.
+  Any package that ships or depends on one cannot run here.
+* **`Symbol`, `Proxy`, `Reflect`, `WeakMap`/`WeakSet`, `Intl` are not
+  implemented**, so packages that build on them — many ORMs, polyfills and
+  transpiled decorator stacks — will not run.
 * **No generators.** `function*` and `yield` parse but throw at run time.
 * **No dynamic `import()`.** Use static imports.
+* **No garbage collector.** Values are reference counted, so reference cycles are
+  never freed. A long-running process that builds cyclic graphs will grow.
 * **Not fast.** A tree-walking interpreter, roughly 10-100x slower than a JIT.
-* **No garbage collector.** Values are reference counted, so reference cycles
-  are never freed. Long-running hosts should avoid building cyclic graphs.
-* **No type checking.** Types are erased, exactly like Node's type stripping.
+  This phase did not attempt interpreter optimisation; that needs a bytecode VM.
+
+**Deliberate gaps in the toolchain.**
+
+* **Dependency resolution is flat.** Each package name resolves to one version. If
+  two ranges cannot be satisfied by the same version, the installer picks the best
+  for the first and warns; it does not build a nested tree. No `overrides`,
+  `resolutions` or workspaces.
+* **No `audit`, `publish`, `update`, `link` or `dedupe`.** No `npx` shorthand
+  beyond `npm exec`.
+* **`require.cache` is a placeholder**, so cache eviction is not available.
+* **Importing a *relative* CommonJS file from an ES module is not interop-wrapped**;
+  only bare package specifiers are. Reach relative CommonJS through `require`.
+* **Remote self-upgrade is not implemented**; `codets upgrade --from <path>` works.
+* **TLS is the platform's** (`native-tls`), so a Linux build needs the system
+  OpenSSL headers at build time. This keeps `codets` itself free of a bundled TLS
+  engine.
+
+**Engine details worth knowing.**
+
 * `Object.freeze` and friends are accepted but do not actually freeze.
-* **Regular expressions** are backed by the `regex` crate, so backreferences and
-  lookaround (`/(?=x)/`, `/(a)\1/`) are rejected. `g`/`i`/`m`/`s` work.
-* `String.prototype.length` counts Unicode code points, not UTF-16 code units,
-  so it differs from JavaScript for non-BMP characters (emoji).
-* **Not implemented**: `Symbol`, `Proxy`, `Reflect`, `WeakMap`/`WeakSet`,
-  `Intl`, `encodeURIComponent`, JSX, `.tsx`.
+* Regular expressions use the `regex` crate, so backreferences and lookaround
+  (`/(?=x)/`, `/(a)\1/`) are rejected. `g`/`i`/`m`/`s` work.
+* `String.prototype.length` counts Unicode code points, not UTF-16 code units, so
+  it differs from JavaScript for non-BMP characters (emoji).
+* `process.env` is a snapshot object; mutating it does not reach child processes
+  (there is no `child_process` yet).
+* `process.memoryUsage()` reports zeros: heap accounting is not implemented.
+* `fs.readFileSync` returns a string even without an encoding, because there are no
+  typed arrays for a `Buffer` to be backed by. `Buffer` is a plain object with
+  numeric properties, so indexing, `length`, `toString`, `slice` and `equals` work
+  but the binary codecs (`readUInt32LE` and friends) do not exist.
+* `EventEmitter`'s `once` stores a self-removing wrapper, so `listeners()` returns
+  the wrapper and `removeListener(event, original)` cannot find it. Removing by the
+  wrapper works.
+* `vm`, `child_process`, `worker_threads`, `net`, `http`, `zlib` and `crypto` are
+  not implemented.
 * TypeScript `namespace` / `module` blocks are rejected with a clear error.
 
 ### Documented behaviour differences
 
-* An `async` function body runs **eagerly** and its result is wrapped in a
-  promise, instead of being deferred to a later microtask. Promise ordering for
-  `then` chains is unaffected.
+* An `async` function body runs **eagerly** and its result is wrapped in a promise,
+  instead of being deferred to a later microtask.
 * `await` **drives the event loop** until the promise settles, then throws a
-  deadlock error if no further events are pending. That makes `await sleep(10)`
-  work without a suspension state machine.
-* Instance field initialisers run **before** the constructor body. A real engine
-  runs a derived class's fields after `super()` returns.
+  deadlock error if no further events are pending.
+* Instance field initialisers run **before** the constructor body, in a derived
+  class too.
 * Module exports are snapshotted when the module body finishes, so a module in an
-  import cycle sees `undefined` for bindings that are declared later in the
-  cycle's other half.
-* No JSX, and no explicit type arguments in a *value* position beyond the call
-  syntax `f<T>(x)` / `new C<T>()`, which is supported.
+  import cycle sees `undefined` for bindings declared later in the cycle's other
+  half.
+* `path.posix` and `path.win32` are the same object: the module follows the host's
+  separator rules rather than emulating the other family.
+* `codets install` creates the toolchain directory locally. Version levels *are*
+  the Node compatibility level of the running binary; a level that needs different
+  engine code needs a new `codets` build.
+* `--node-version` accepts a major and uses that line's baseline release
+  (`18` → `18.20.4`); a full version is taken exactly as written.
 
 ## Architecture
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). In short: `lexer` → `parser`
-(which erases TypeScript) → `ast` → `interp` (tree walking) on top of the
-`value` object model, with `builtins` supplying the standard library and
-`modules` doing ES module resolution. The engine sits behind a narrow interface
-so a different VM could be swapped in later without changing the public API.
-
-## Development
-
-```bash
-cargo test        # 73 tests: lexer, parser, runtime semantics, modules, doc example
-cargo run -- tests/fixtures/modules/main.ts
+```text
+                 codets                 node                  npm
+                    │                    │                     │
+                    └──────── cli.rs ────┴─────────────────────┘
+                                 │
+              ┌──────────────────┼───────────────────┐
+              ▼                  ▼                   ▼
+        node/ (process,    commonjs.rs +       npm/ (semver, registry,
+        compat, features)  core_modules.rs     install, lockfile)
+              │                  │                   │
+              └──────────────────┼───────────────────┘
+                                 ▼
+   lexer.rs → parser.rs (erases TypeScript) → ast.rs → interp.rs
+                                                          │
+                                    value.rs │ builtins.rs │ modules.rs
 ```
 
-On Windows with a Visual Studio installation that only ships the `onecore`
-toolset libraries, linking fails with `LNK1104: cannot open file 'msvcrt.lib'`.
-Point `LIB` at the MSVC `onecore\x64` folder plus the Windows SDK's `ucrt\x64`
-and `um\x64` folders before running cargo.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design decisions behind
+each layer.
+
+## Building
+
+```bash
+cargo build --release      # three binaries in target/release
+cargo test                 # 146 tests
+```
+
+On Windows with a Visual Studio installation that ships only the `onecore` toolset
+libraries, linking fails with `LNK1104: cannot open file 'msvcrt.lib'`. Point `LIB`
+at the MSVC `onecore\x64` folder plus the Windows SDK's `ucrt\x64` and `um\x64`
+folders before running cargo.
+
+## Repository layout
+
+```text
+src/
+  lexer.rs  parser.rs  ast.rs          the front end, TypeScript-aware
+  interp.rs  value.rs  builtins.rs     the engine and its standard library
+  modules.rs                           the ES module loader
+  cli.rs                               the three command personalities
+  node/                                process, compatibility levels, features
+  commonjs.rs  core_modules.rs         require and the Node standard library
+  npm/                                 semver, registries, the installer
+  versions.rs                          the built-in version manager
+  net.rs                               the single place that uses the network
+tests/
+  cli.rs  commonjs.rs  npm_install.rs  runtime.rs   fixtures/
+docs/ARCHITECTURE.md
+scripts/bench-npm-install.ps1
+```
+
+## History
+
+This project was published as **`rust4ts`** (`0.1.0`), an embeddable JS/TS engine
+for Rust hosts. `0.2.0` turns it into `codets`: the toolchain, the Node-compatible
+command line, CommonJS, the core modules and the package manager are all new, and
+the embedding API from `0.1.0` still works unchanged. See
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ## 中文说明
 
-`rust4ts` 是一个**纯 Rust** 的 JavaScript / TypeScript 引擎，**原生支持
-TypeScript**：解析器直接吃 TS 语法并在构建 AST 时擦除类型，没有独立的编译步骤。
-它适合把 JS/TS 插件嵌入 Rust 宿主程序（游戏、桌面外壳、插件系统），不需要 C 工具
-链，也不依赖 Node.js。唯一的第三方依赖是纯 Rust 的 `regex`。
+`codets` 是一个**纯 Rust** 的 JavaScript / TypeScript 工具链，用来替代
+Node.js 与 npm。一次构建产出三个命令：`codets`、`node`、`npm`，放到 `PATH` 上
+即可直接顶替原来的 `node` 与 `npm`。**原生支持 TypeScript**：解析器直接吃 TS
+语法并在构建 AST 时擦除类型，没有独立的编译步骤。
 
-crate 名称是 `rust4ts`，因为 crates.io 上 `rustts` 已被他人占用（其描述为
-`DEPRECATED: renamed to manivelle`），而 `rust-ts` 去掉连字符后与 `rustts` 归一化
-相同，会被 crates.io 判为重复。
+已经真正跑通的（都有自动化测试或实测记录）：CommonJS 的 `require` 与
+`node_modules` 解析、`package.json` 的 `exports`/`main`、核心模块
+（`path`/`fs`/`os`/`events`/`util`/`assert`/`querystring`/`buffer`/`timers`/`module`/`process`）、
+内置版本管理器（`codets install/use/default/current/versions`）、以及
+**多线程并行安装**——24 个包用 8 线程比 1 线程快 **5.34 倍**（`scripts/bench-npm-install.ps1`
+可复现，两次安装产物完全一致）。也已实测从 npm 官方源安装真实包
+（`is-odd` + 传递依赖 `is-number`）并成功运行。
 
-**能力边界（重要）**：不支持 npm/`node_modules`、CommonJS、生成器、动态
-`import()`；性能不追求（树遍历解释器）；引用计数不做循环回收；`enum` 与构造器参数
-属性是仅有的两个具有运行时语义的 TS 构造。完整清单见上文 *Limits*。
+**能力边界（重要）**：JS 执行语义按语言规范保持单线程，多线程只存在于 npm
+安装层；不支持原生插件（`.node`，它绑定 V8 的 ABI）、`Symbol`/`Proxy`/`Reflect`、
+生成器、动态 `import()`；依赖解析是扁平的，不做嵌套树、workspaces、`overrides`；
+解释器是树遍历实现，比 V8 慢一到两个数量级，本期没有做解释器层面的优化（那需要
+字节码 VM）；`fs.readFileSync` 总是返回字符串，因为没有 TypedArray。完整清单见上文
+*Limits*。
 
 ## License
 

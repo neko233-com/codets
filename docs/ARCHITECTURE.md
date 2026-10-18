@@ -1,23 +1,25 @@
 # Architecture
 
+```text
+                 codets                 node                  npm
+                    │                    │                     │
+                    └──────── cli.rs ────┴─────────────────────┘
+                                 │
+              ┌──────────────────┼───────────────────┐
+              ▼                  ▼                   ▼
+        node/ (process,    commonjs.rs +       npm/ (semver, registry,
+        compat, features)  core_modules.rs     install, lockfile)
+              │                  │                   │
+              └──────────────────┼───────────────────┘
+                                 ▼
+   lexer.rs → parser.rs (erases TypeScript) → ast.rs → interp.rs
+                                                          │
+                                    value.rs │ builtins.rs │ modules.rs
 ```
-source text
-    │
-    ▼
-lexer.rs      hand-written tokenizer (shared by JS and TS)
-    │  Tok::Num / Str / Template* / Regex / Ident / Punct, plus `nl_before`
-    ▼
-parser.rs     recursive descent + Pratt expressions
-    │  erases TypeScript while building the tree
-    ▼
-ast.rs        Stmt / Expr / Pattern / Class / Func
-    │
-    ▼
-interp.rs     tree-walking evaluator
-    ├── value.rs     Value, Object, PropMap, Function, Env
-    ├── builtins.rs  prototypes, standard library, regex, JSON, Promise
-    └── modules.rs   ES module resolution, linking and evaluation
-```
+
+The engine half of that picture is unchanged since 0.1.0. What 0.2.0 added is
+everything above it: the command line, the Node surface area, the two module
+systems, the core modules and the package manager.
 
 ## Design decisions
 
@@ -91,14 +93,116 @@ declared later in the module are still exported.
 
 ## Testing strategy
 
-* `src/lexer.rs` and `src/parser.rs` carry unit tests next to the code.
+* `src/lexer.rs`, `src/parser.rs` and each new module carry unit tests next to the
+  code: semver ordering and ranges, base64 digests, packument parsing, version
+  store resolution, `package.json` editing, and `parallel_map`'s order and
+  thread use.
 * The parser suite's key assertion is **AST equality**: each TypeScript snippet is
   compared against the equivalent JavaScript snippet, so "the types were erased"
   is verified structurally instead of assumed.
 * `tests/runtime.rs` runs real TypeScript source end to end and checks console
   output, including a multi-file plugin fixture, an import cycle, and a rejected
   bare specifier.
-* The crate documentation example is a doc test.
+* `tests/cli.rs` executes the three real binaries, because the compatibility claim
+  is about the commands on `PATH`: version output, feature gating per Node level,
+  `-e`/`-p`/`--check`, exit codes, `process` events at exit, and the version
+  manager installing, switching and writing shims.
+* `tests/commonjs.rs` writes small projects into scratch directories and runs
+  them, so `node_modules` walking, `exports` maps, cycles, JSON modules, the core
+  modules and ES-to-CommonJS interop are exercised as a program would exercise
+  them.
+* `tests/npm_install.rs` generates real gzipped tarballs, so the installer's
+  integrity check, unpacking, bin links and lockfile are tested against the real
+  formats rather than a stub. It also asserts that one worker and eight workers
+  produce the same packages, which is what makes the benchmark's timing comparison
+  meaningful.
+* `scripts/bench-npm-install.ps1` is the performance evidence: it builds a local
+  registry, installs it serial and parallel, checks the trees match, and reports
+  the speed-up.
+
+## The Node layer
+
+**One binary, three personalities.** `argv[0]` decides whether the process is
+`codets`, `node` or `npm`, and `--codets-as=<name>` overrides it. The override
+exists because the version manager's shims are copies of the same executable: the
+operating system reports whatever filename it was invoked through, which is how a
+`node.cmd` shim ends up asking for Node's command line.
+
+**Compatibility is a value, not a build flag.** `node::NodeCompat` is a Node
+release, and it is the single input to two decisions: what `process.version`
+reports, and which standard-library features `node::features` installs. A feature
+is in the engine only when the selected release has it, so `--node-version=18`
+genuinely lacks `Object.groupBy` — it is not hidden behind a check that any script
+could see through. `Feature` lists only features that are really implemented;
+advertising one that is not would make `codets features` a lie.
+
+**`process` reads live state.** `argv`, `argv0` and `execArgv` are accessors rather
+than snapshots, because the command line sets them after the process object is
+built. `process.exit` is a distinct `Control` variant rather than a thrown value,
+so it travels through `try`/`catch` untouched — the same guarantee Node gives, and
+one that a thrown sentinel would not provide.
+
+**Two module systems, one resolution rule.** `commonjs.rs` owns the `node_modules`
+walk and `package.json` `exports` handling, and the ES module loader calls into it
+for bare specifiers instead of growing a second implementation. What differs is
+only what happens to the file once it is found: an `.mjs`/`.mts` file is evaluated
+as a module, and anything else is evaluated as CommonJS and then presented as a
+namespace (`module.exports` as `default`, its own enumerable properties as named
+exports). Core modules are handed over directly, with themselves as `default`, so
+both `import fs from 'node:fs'` and `import { readFileSync } from 'node:fs'` bind.
+
+**The CommonJS cache is per realm and keyed by canonical path**, and the entry is
+written *before* the module body runs. That ordering is what makes a `require`
+cycle return the partially built `exports` object instead of recursing until the
+stack runs out.
+
+**Core modules are built on demand.** They are ordinary objects with native
+functions on them, which is why `class Ticker extends EventEmitter {}` works: the
+`EventEmitter` constructor is a native function carrying a `prototype` object, and
+the class machinery looks no further than that.
+
+## The package manager
+
+**Resolution is flat and says so.** Each package name is resolved once, against
+every range requested for it, and the highest published version satisfying all of
+them wins. When no version can satisfy them all, the installer takes the best for
+the first request and records a warning naming the nested copy that would have been
+needed. The alternative — a nested tree — is a much larger piece of work, and
+pretending to do it silently would be worse than reporting the boundary.
+
+**Parallelism lives here, and only here.** JavaScript execution is single-threaded
+by specification, so the only place concurrency can pay is the installer.
+`install::parallel_map` runs a shared work queue on `--jobs` threads and preserves
+input order, so a slow package cannot idle the other workers and the result does
+not depend on scheduling. Each step of a package's installation — fetch, verify,
+unpack — happens on whichever worker picks it up, which means the phases overlap
+across packages even though they are sequential within one.
+
+**Nothing is written before it is verified.** A `sha512` digest from the registry
+is checked against the bytes received, and untar rejects any entry whose path would
+escape the destination directory. A mismatch is a warning against that one package,
+not a failed install: one bad package in a tree should not stop the other
+nineteen.
+
+**Registries are an interface with two implementations.** The HTTP one speaks the
+npm protocol; the directory one reads the same document shape off disk. The second
+is not a test double — it is how the tests run offline and how an internal mirror
+would be used — which is why the installer has no test-only code path.
+
+## The version manager
+
+**A toolchain directory is a Node compatibility level.** `codets install 22`
+materialises `versions/22.12.0/` with a manifest and its own shims, and `use` points
+the store's `current` file at it. The shims pass `--node-version` and
+`--codets-as`, so one executable serves all three command names at whichever level
+is active. None of this needs the network; only replacing the *binary* does, which
+is what `codets upgrade --from` is for.
+
+**Resolution is a chain with a defined order** — environment variable, project
+pin, current pointer, configured default, built-in default — because a version
+manager that cannot explain *why* it chose a version is worse than useless. Each
+step records a `VersionSource`, and `codets current` prints it.
+
 
 ## Where a different VM would plug in
 

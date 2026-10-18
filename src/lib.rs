@@ -1,59 +1,69 @@
-//! # rust4ts
+//! # codets
 //!
-//! A pure-Rust JavaScript & TypeScript engine with **native TypeScript support**.
+//! A pure-Rust JavaScript & TypeScript toolchain that replaces Node.js and npm,
+//! with **native TypeScript support**.
 //!
-//! `rust4ts` is meant to be embedded in a Rust application (game engine, desktop
-//! shell, plugin host) where you want to run user-supplied `.ts` / `.js` scripts
-//! without shipping a C toolchain and without depending on Node.js.
+//! The crate is both a command line and a library:
 //!
-//! ## Why a from-scratch engine?
-//!
-//! Embedding options such as `rquickjs` or `deno_core` bind a C/C++ engine. That
-//! forces a native toolchain on every consumer and complicates cross-compilation.
-//! `rust4ts` is written in 100% Rust — the single dependency is the pure-Rust
-//! `regex` crate — so `cargo add rust4ts` just works.
+//! * Installing it gives you three commands — `codets`, `node` and `npm` — that
+//!   are the same program, chosen by `argv[0]`. See [`cli`].
+//! * The library is the engine plus the Node surface area: [`Runtime`] for
+//!   embedding, [`commonjs`] for `require`, [`core_modules`] for the standard
+//!   library, [`node`] for `process` and the compatibility levels, and [`npm`]
+//!   for the package manager.
 //!
 //! ## Native TypeScript
 //!
 //! There is no transpile step and no separate declaration pipeline. The parser
 //! understands TypeScript syntax directly and erases types while building the
 //! AST: `interface`, `type`, generics, `as`, `!`, `readonly`, decorators and
-//! `public`/`private` cost nothing at run time. `enum` is the only TS construct
-//! with runtime semantics, so it is kept in the tree and evaluated.
+//! `public`/`private` cost nothing at run time. `enum` and constructor parameter
+//! properties are the only TS constructs with runtime semantics, so they are the
+//! only ones kept in the tree.
 //!
-//! ## Scope
+//! ## Dependencies
 //!
-//! The target is **your own plugin and application code**, not the npm
-//! ecosystem:
-//!
-//! * ES modules only (`import` / `export`, including `import.meta`). There is no
-//!   CommonJS `require` shim and no `node_modules` resolution.
-//! * A tree-walking interpreter: correctness first, not speed.
-//! * Reference-counted values; reference cycles are not collected.
-//! * No type checking — types are erased, exactly like Node's type stripping.
-//! * Generators, `Symbol` and object freezing are not implemented.
+//! The engine needs only the pure-Rust `regex` crate. The package manager adds
+//! `flate2` (with its Rust backend), `tar`, `sha2` and `ureq` — all pure Rust, with
+//! TLS coming from the platform rather than a bundled engine. Building `codets`
+//! therefore needs no C toolchain.
 //!
 //! ## Example
 //!
 //! ```no_run
-//! use rust4ts::Runtime;
+//! use codets::Runtime;
 //!
 //! let mut runtime = Runtime::new();
 //! let output = runtime.run_source(
 //!     "const greet = (who: string): string => `hi ${who}`;\nconsole.log(greet('world'));",
-//!     rust4ts::Language::Ts,
+//!     codets::Language::Ts,
 //! )?;
 //! assert_eq!(output.trim(), "hi world");
-//! # Ok::<(), rust4ts::Error>(())
+//! # Ok::<(), codets::Error>(())
 //! ```
+//!
+//! ## What it is not
+//!
+//! A tree-walking interpreter with reference-counted values: reference cycles are
+//! never collected and it is far slower than a JIT. Native addons (`.node`) cannot
+//! load, `Symbol`/`Proxy`/`Reflect` and generators are not implemented, and
+//! dependency resolution is flat. The README's *Limits* section is the complete
+//! list; treat anything absent there as a bug and anything present as deliberate.
 
 pub mod ast;
 pub mod builtins;
+pub mod cli;
+pub mod commonjs;
+pub mod core_modules;
 pub mod interp;
 pub mod lexer;
 pub mod modules;
+pub mod net;
+pub mod node;
+pub mod npm;
 pub mod parser;
 pub mod value;
+pub mod versions;
 
 pub use interp::{Control, Interp, JsError};
 pub use modules::ModuleLoader;
@@ -72,6 +82,8 @@ pub enum Error {
     Uncaught(JsError),
     /// Reading a module from disk failed.
     Io(String),
+    /// The script called `process.exit(code)`.
+    Exit(i32),
 }
 
 impl std::fmt::Display for Error {
@@ -80,6 +92,7 @@ impl std::fmt::Display for Error {
             Error::Parse(error) => write!(f, "{error}"),
             Error::Uncaught(error) => write!(f, "{}", error.render()),
             Error::Io(message) => write!(f, "{message}"),
+            Error::Exit(code) => write!(f, "process exited with code {code}"),
         }
     }
 }
@@ -103,14 +116,18 @@ impl From<Control> for Error {
             Control::Continue(_) => {
                 Error::Io("unexpected `continue` outside a loop".to_string())
             }
+            Control::Exit(code) => Error::Exit(code),
         }
     }
 }
 
-/// A script runtime: an interpreter plus a module loader rooted at a directory.
+/// A script runtime: an interpreter, a Node.js host, and a module loader rooted
+/// at a directory.
 pub struct Runtime {
     pub interp: Interp,
     pub loader: ModuleLoader,
+    /// The Node.js process state behind `process`.
+    pub node: Rc<node::NodeHost>,
 }
 
 impl Default for Runtime {
@@ -120,20 +137,55 @@ impl Default for Runtime {
 }
 
 impl Runtime {
-    /// Create a runtime whose module resolution starts in the current directory.
+    /// Create a runtime whose module resolution starts in the current directory,
+    /// speaking the newest supported Node.js release.
     pub fn new() -> Runtime {
-        Runtime {
-            interp: Interp::new(),
-            loader: ModuleLoader::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-        }
+        Runtime::with_compat(node::NodeCompat::default())
     }
 
     /// Create a runtime that resolves relative imports from `root`.
     pub fn with_root(root: impl Into<PathBuf>) -> Runtime {
+        Runtime::with_compat_and_root(node::NodeCompat::default(), root)
+    }
+
+    /// Create a runtime that claims to be a specific Node.js release.
+    pub fn with_compat(compat: node::NodeCompat) -> Runtime {
+        Runtime::with_compat_and_root(
+            compat,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
+    }
+
+    /// Both at once: a Node.js release and a module root.
+    pub fn with_compat_and_root(compat: node::NodeCompat, root: impl Into<PathBuf>) -> Runtime {
+        let mut interp = Interp::new();
+        let host = Rc::new(node::NodeHost::new(compat));
+        host.install(&mut interp);
         Runtime {
-            interp: Interp::new(),
+            interp,
             loader: ModuleLoader::new(root),
+            node: host,
         }
+    }
+
+    /// Record which script is running, so `process.argv` and `process.argv0` are
+    /// what Node would report.
+    ///
+    /// `process.cwd()` deliberately keeps the directory the command was run from:
+    /// Node resolves relative *imports* against the importing file, which the
+    /// module loader already does, while `cwd()` reports the shell's directory.
+    pub fn set_script(&mut self, path: impl AsRef<Path>, args: Vec<String>) {
+        let path = path.as_ref();
+        *self.node.script_path.borrow_mut() = Some(path.to_string_lossy().to_string());
+        if let Some(name) = path.file_name() {
+            *self.node.argv0.borrow_mut() = name.to_string_lossy().to_string();
+        }
+        *self.node.script_args.borrow_mut() = args;
+    }
+
+    /// Resolve relative imports against this directory from now on.
+    pub fn set_module_root(&mut self, root: impl Into<PathBuf>) {
+        self.loader = ModuleLoader::new(root);
     }
 
     /// Print `console` output to the process's standard output.

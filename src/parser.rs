@@ -788,7 +788,7 @@ impl Parser {
         if self.ts {
             if self.at_punct("@") {
                 while self.at_punct("@") {
-                    self.warn("decorator ignored: rust4ts does not run decorators");
+                    self.warn("decorator ignored: codets does not run decorators");
                     self.skip_decorator()?;
                 }
             }
@@ -813,7 +813,7 @@ impl Parser {
                 && matches!(self.peek(1), Tok::Ident(_) | Tok::Str(_))
             {
                 return self.err(
-                    "TypeScript `namespace` / `module` blocks are not supported by rust4ts",
+                    "TypeScript `namespace` / `module` blocks are not supported by codets",
                 );
             }
             if self.at_ident("abstract") && self.peek(1).is_ident("class") {
@@ -1941,7 +1941,7 @@ impl Parser {
             }
             if self.at_punct("@") {
                 while self.at_punct("@") {
-                    self.warn("decorator ignored: rust4ts does not run decorators");
+                    self.warn("decorator ignored: codets does not run decorators");
                     self.skip_decorator()?;
                 }
             }
@@ -3364,7 +3364,7 @@ mod tests {
         }
 
         // TypeScript reads `a < b > (c)` as a call with a type argument, and so
-        // does rust4ts. JavaScript mode keeps it a comparison.
+        // does codets. JavaScript mode keeps it a comparison.
         assert!(matches!(
             &ts("a < b > (c);")[0],
             Stmt::Expr(Expr::Call { .. })

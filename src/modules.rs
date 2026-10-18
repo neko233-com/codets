@@ -30,6 +30,15 @@ struct CacheEntry {
     namespace: Value,
 }
 
+/// True when a specifier names a path rather than a package.
+fn is_relative_specifier(specifier: &str) -> bool {
+    specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || specifier.starts_with(".\\")
+        || specifier.starts_with("..\\")
+        || Path::new(specifier).is_absolute()
+}
+
 impl ModuleLoader {
     /// Create a loader whose relative resolution starts at `root`.
     pub fn new(root: impl Into<PathBuf>) -> ModuleLoader {
@@ -278,14 +287,70 @@ impl ModuleLoader {
     }
 
     /// Resolve a specifier written inside `from_dir` and load it.
+    ///
+    /// Three kinds of specifier arrive here, and each is handled the way Node
+    /// would: a core module (`node:fs` or `fs`), a package found through
+    /// `node_modules`, and a relative or absolute path.
     fn resolve_specifier(
         &mut self,
         interp: &mut Interp,
         specifier: &str,
         from_dir: &Path,
     ) -> Result<Value, Error> {
+        // A core module is handed over as the module object, with itself as the
+        // default export so that both `import fs from 'node:fs'` and
+        // `import { readFileSync } from 'node:fs'` bind.
+        if crate::core_modules::is_core(specifier) {
+            if let Some(module) = crate::core_modules::resolve(interp, specifier) {
+                if let Value::Object(object) = &module {
+                    object.borrow_mut().props.set("default", module.clone());
+                }
+                return Ok(module);
+            }
+        }
+        // A bare specifier is a package. The CommonJS resolver already implements
+        // the `node_modules` walk and `package.json` `exports`, so it answers the
+        // question here too; the file it finds is then loaded as ES or CommonJS.
+        if !is_relative_specifier(specifier) {
+            let path = crate::commonjs::resolve_specifier(specifier, from_dir)
+                .map_err(Error::Io)?;
+            return self.load_interop(interp, &path);
+        }
         let path = self.resolve_relative(specifier, from_dir)?;
         self.load(interp, &path)
+    }
+
+    /// Load a resolved package entry point, choosing ES or CommonJS by extension.
+    ///
+    /// A CommonJS package is presented to an ES module the way Node presents it:
+    /// `module.exports` becomes the default export, and its own enumerable
+    /// properties become named exports.
+    fn load_interop(&mut self, interp: &mut Interp, path: &Path) -> Result<Value, Error> {
+        let extension = path
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if matches!(extension.as_str(), "mjs" | "mts") {
+            return self.load(interp, path);
+        }
+        let exports = crate::commonjs::load_path(interp, path)?;
+        let namespace = interp.new_object();
+        {
+            let mut borrowed = namespace.borrow_mut();
+            borrowed.props.set("default", exports.clone());
+            if let Value::Object(exported) = &exports {
+                let entries: Vec<(String, Value)> = exported
+                    .borrow()
+                    .props
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                for (name, value) in entries {
+                    borrowed.props.set(name, value);
+                }
+            }
+        }
+        Ok(Value::Object(namespace))
     }
 
     /// Turn a specifier into a path, rejecting bare package names.
@@ -297,7 +362,7 @@ impl ModuleLoader {
             && !Path::new(specifier).is_absolute()
         {
             return Err(Error::Io(format!(
-                "cannot resolve `{specifier}`: rust4ts has no node_modules resolution, use a relative or absolute path"
+                "cannot resolve `{specifier}`: codets has no node_modules resolution, use a relative or absolute path"
             )));
         }
         let base = if Path::new(specifier).is_absolute() {

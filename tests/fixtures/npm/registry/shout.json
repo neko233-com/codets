@@ -1,0 +1,9 @@
+{
+  "name": "shout",
+  "versions": {
+    "2.0.0": {
+      "dist": { "tarball": "shout-2.0.0.tgz" },
+      "dependencies": {}
+    }
+  }
+}

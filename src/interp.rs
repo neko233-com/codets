@@ -30,6 +30,11 @@ pub enum Control {
     Return(Value),
     Break(Option<String>),
     Continue(Option<String>),
+    /// `process.exit(code)`: terminate the host process.
+    ///
+    /// This is deliberately not a [`Control::Throw`], so a `try` / `catch` in
+    /// script code cannot swallow it — the same guarantee Node gives.
+    Exit(i32),
 }
 
 /// A thrown JavaScript value together with the frames it passed through.
@@ -37,6 +42,24 @@ pub enum Control {
 pub struct JsError {
     pub value: Value,
     pub frames: Vec<String>,
+}
+
+impl Control {
+    /// Render a non-local exit the way a command line should report it.
+    ///
+    /// Only [`Control::Throw`] is a real script error; the other variants are
+    /// control flow that escaped its construct, which is a bug in the script.
+    pub fn render(&self) -> String {
+        match self {
+            Control::Throw(error) => error.render(),
+            Control::Exit(code) => format!("process exited with code {code}"),
+            Control::Return(value) => {
+                format!("unexpected `return` of {}", value.to_display_string())
+            }
+            Control::Break(_) => "unexpected `break` outside a loop".to_string(),
+            Control::Continue(_) => "unexpected `continue` outside a loop".to_string(),
+        }
+    }
 }
 
 impl JsError {
@@ -93,6 +116,32 @@ impl Output {
             }
         }
     }
+
+    /// Write text with no trailing newline, flushing it in stream mode.
+    fn write_raw(&self, text: &str) {
+        match self {
+            Output::Stdout => {
+                use std::io::Write;
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(text.as_bytes());
+                let _ = stdout.flush();
+            }
+            Output::Buffer(buffer) => buffer.borrow_mut().push_str(text),
+        }
+    }
+
+    /// Write diagnostics, which go to standard error in stream mode.
+    fn write_err(&self, text: &str) {
+        match self {
+            Output::Stdout => {
+                use std::io::Write;
+                let mut stderr = std::io::stderr();
+                let _ = stderr.write_all(text.as_bytes());
+                let _ = stderr.flush();
+            }
+            Output::Buffer(buffer) => buffer.borrow_mut().push_str(text),
+        }
+    }
 }
 
 /// A pending microtask: a reaction scheduled by promise resolution.
@@ -118,6 +167,10 @@ pub struct Interp {
     pub frames: Vec<String>,
     /// Guards against runaway recursion.
     pub max_depth: usize,
+    /// Loaded CommonJS modules, keyed by canonical path. The entry is inserted
+    /// before a module body runs, which is what makes a `require` cycle see the
+    /// partial `exports` object instead of recursing forever.
+    pub cjs_cache: std::collections::HashMap<std::path::PathBuf, Value>,
 }
 
 impl Interp {
@@ -140,6 +193,7 @@ impl Interp {
             current_source: None,
             frames: Vec::new(),
             max_depth: 900,
+            cjs_cache: std::collections::HashMap::new(),
         };
         builtins::install(&mut interp);
         interp
@@ -162,6 +216,20 @@ impl Interp {
         self.output.write_line(line);
     }
 
+    /// Write text with no trailing newline — `process.stdout.write`.
+    pub fn print_raw(&self, text: &str) {
+        self.output.write_raw(text);
+    }
+
+    /// Write text to the diagnostics stream — `process.stderr.write`.
+    ///
+    /// In stream mode this is the real standard error. When output is captured
+    /// (the test suite) it lands in the same buffer, so a test sees writes in
+    /// the order the program made them.
+    pub fn print_error(&self, text: &str) {
+        self.output.write_err(text);
+    }
+
     // ----------------------------------------------------------- constructors
 
     /// A plain object with the given prototype.
@@ -172,6 +240,13 @@ impl Interp {
     /// A fresh module scope, whose parent is the global scope.
     pub fn module_env(&self) -> EnvRef {
         Env::new(Some(self.globals.clone()), true)
+    }
+
+    /// The canonical path of a module file, so the cache has one key per file
+    /// even when the same module is reached by different relative routes.
+    pub fn canonical_path(&self, path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        std::fs::canonicalize(path)
+            .map_err(|error| format!("cannot resolve {}: {error}", path.display()))
     }
 
     /// An array holding `items`.
@@ -1531,7 +1606,7 @@ impl Interp {
         home: Option<ObjectRef>,
     ) -> Result<Value, Control> {
         if func.is_generator {
-            return self.type_error("generator functions are not supported by rust4ts");
+            return self.type_error("generator functions are not supported by codets");
         }
         Ok(self.new_user_function(UserFunction {
             name: func.name.clone(),
@@ -1951,7 +2026,7 @@ impl Interp {
                 self.await_value(value)
             }
             Expr::Yield { .. } => {
-                self.type_error("generators are not supported by rust4ts")
+                self.type_error("generators are not supported by codets")
             }
         }
     }
