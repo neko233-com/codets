@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+.codely-cli/
+CODELY.md
+.idea/
+.vscode/
+*.tmp

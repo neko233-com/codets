@@ -1,0 +1,5 @@
+# Normalise line endings: store LF in the repository, check out LF everywhere,
+# so the published crate and the working tree agree.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

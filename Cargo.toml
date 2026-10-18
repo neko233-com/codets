@@ -1,0 +1,30 @@
+[package]
+name = "rust4ts"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "A pure-Rust JavaScript & TypeScript engine with native TypeScript support. Run ESM .ts/.js plugins inside your Rust app with no C toolchain and no Node.js."
+license = "MIT"
+repository = "https://github.com/neko233-com/rust4ts"
+homepage = "https://github.com/neko233-com/rust4ts"
+documentation = "https://docs.rs/rust4ts"
+readme = "README.md"
+keywords = ["javascript", "typescript", "interpreter", "runtime", "scripting"]
+categories = ["development-tools", "compilers", "web-programming"]
+exclude = ["/.github/**", "/.codely-cli/**", "/CODELY.md"]
+
+[lib]
+name = "rust4ts"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rust4ts"
+path = "src/main.rs"
+
+[dependencies]
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
