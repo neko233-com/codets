@@ -81,11 +81,31 @@ function Find-Cargo {
     return $null
 }
 
+# A Visual Studio installation that ships only the `onecore` toolset cannot link Rust
+# output on its own: rustc does not discover the Windows SDK's library folders, so
+# `link.exe` fails with LNK1104 "cannot open file msvcrt.lib" the moment anything
+# actually has to be linked. A gate that passes only while the build cache happens to
+# be warm is not a gate, so it points `LIB` at those folders itself when it finds that
+# layout, and leaves an already-configured environment alone.
+function Set-MsvcLibraryPath {
+    if ($env:LIB) { return }
+    $msvc = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\lib\onecore\x64' -Directory -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | Select-Object -First 1
+    $ucrt = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Lib\*\ucrt\x64' -Directory -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | Select-Object -First 1
+    if (-not $msvc -or -not $ucrt) { return }
+    $um = $ucrt.FullName -replace '\\ucrt\\x64$', '\um\x64'
+    if (-not (Test-Path $um)) { return }
+    $env:LIB = "$($msvc.FullName);$($ucrt.FullName);$um"
+    Write-Host "pre-release: pointed LIB at the onecore toolset layout (see AGENTS.md)"
+}
+
 $cargo = Find-Cargo
 if (-not $cargo) {
     Fail "cannot find cargo; see AGENTS.md for this machine's toolchain layout"
 }
 Write-Host "pre-release: using $cargo"
+Set-MsvcLibraryPath
 
 Write-Step '1/5 the working tree'
 if ($AllowDirty) {
@@ -106,9 +126,7 @@ if ($LASTEXITCODE -ne 0) { Fail 'the test suite failed' }
 
 Write-Step '3/5 cargo build --release --locked'
 & $cargo build --release --locked
-if ($LASTEXITCODE -ne 0) {
-    Fail 'the release build failed; on Windows, check the LIB note in AGENTS.md'
-}
+if ($LASTEXITCODE -ne 0) { Fail 'the release build failed' }
 
 Write-Step '4/5 temp leftovers'
 & (Join-Path $PSScriptRoot 'check-temp-clean.ps1')

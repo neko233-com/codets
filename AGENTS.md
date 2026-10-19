@@ -19,6 +19,9 @@ Two environment quirks are worth knowing about on Windows:
 * A Visual Studio installation that ships only the `onecore` toolset makes
   `link.exe` fail with `LNK1104: cannot open file 'msvcrt.lib'`. Point `LIB` at the
   MSVC `onecore\x64` folder plus the SDK's `ucrt\x64` and `um\x64` folders first.
+  `scripts/pre-release.ps1` does this itself when it finds that layout — a gate that
+  only passes while the build cache is warm is not a gate — but a plain `cargo`
+  invocation still needs it by hand.
 * When the rustup proxy scripts are missing from `~/.cargo/bin`, `cargo` is not on
   `PATH`. Call the toolchain directly:
   `~/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe`. `cargo
