@@ -37,9 +37,9 @@ prove it works before doing so.
   which of those decided it, on stderr so that piping stdout still yields a bare URL.
 * **A release pipeline** (`.github/workflows/release.yml`), triggered by `v*` tags
   only. It refuses a tag that disagrees with `Cargo.toml` or that is not an ancestor
-  of the default branch, runs the test suite before spending six runners on the
-  matrix, publishes `.tar.gz` archives for six platforms and one checksum file, and
-  takes the release notes from this file.
+  of the default branch, runs the test suite before spending the platform runners on
+  the matrix, publishes `.tar.gz` archives for five platforms and one checksum file,
+  and takes the release notes from this file.
 * **`AGENTS.md`**: the release rule, the rules the test suite follows and the asset
   naming contract, for anyone changing this repository.
 * **`scripts/pre-release.{sh,ps1}`**: the gate a release has to pass locally — clean
@@ -58,6 +58,15 @@ prove it works before doing so.
 
 ### Changed
 
+* **Five platforms, and Intel macOS is not one of them.** The matrix builds the two
+  Windows MSVC triples, the two Linux GNU triples and `aarch64-apple-darwin`. Apple
+  has shipped no Intel Mac since 2020, and GitHub's last Intel image (`macos-13`) is
+  so backlogged that the first release attempt queued for hours behind it without
+  ever getting a runner, while every other platform — including the cross-compiled
+  Windows ARM64 build — finished in minutes. `codets upgrade` and both installers
+  tell an Intel Mac that there is no published build rather than fetching a binary it
+  cannot run, and a test compares the workflow's matrix with
+  `release::published_triples()` so the two lists cannot drift apart.
 * **A version directory is now a hard-linked copy of the toolchain rather than a
   directory of shell shims.** `bin/` links to the active version's binary, and the
   binary picks its command personality from `argv[0]`, so `node` and `npm` need no

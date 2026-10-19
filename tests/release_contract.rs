@@ -206,3 +206,35 @@ fn upgrading_twice_leaves_the_same_store() {
         "a second upgrade of the same version changed the store"
     );
 }
+
+#[test]
+fn the_workflow_builds_exactly_the_published_platforms() {
+    // Two lists have to say the same thing: the matrix that builds the assets, and
+    // `published_triples()`, which is what `codets upgrade` and both installers trust.
+    // This is the check that notices when one of them changes without the other.
+    let workflow = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml"),
+    )
+    .expect("the workflow file");
+
+    let mut built: Vec<&str> = workflow
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- target: "))
+        .collect();
+    built.sort_unstable();
+    let mut published: Vec<&str> = release::published_triples().to_vec();
+    published.sort_unstable();
+    assert_eq!(
+        built, published,
+        "the workflow matrix and release::published_triples disagree"
+    );
+
+    // The platform decision itself. Intel macOS is left out on purpose: Apple has
+    // shipped no Intel Mac since 2020, and GitHub's last Intel image (macos-13) is so
+    // backlogged that a release once queued for hours behind it while every other
+    // platform finished in minutes.
+    assert!(
+        !published.contains(&"x86_64-apple-darwin"),
+        "Intel macOS is deliberately not published; see AGENTS.md, \"Supported platforms\""
+    );
+}

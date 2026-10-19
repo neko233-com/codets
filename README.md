@@ -46,6 +46,10 @@ than the built-in default. `CODETS_VERSION` pins a release, `CODETS_HOME` moves
 the store, and `CODETS_DOWNLOAD_BASE` / `CODETS_API_BASE` point the download at a
 mirror.
 
+Published builds cover Windows, Linux and macOS on both x64 and ARM64, except
+macOS, which is Apple Silicon only: an Intel Mac is told there is no published build
+rather than given one it cannot run.
+
 Or build it yourself and install that build:
 
 ```bash
@@ -60,7 +64,7 @@ the commands in this repository rather than estimated:
 
 | | |
 |---|---|
-| Tests | **207 tests, all passing** (`cargo test`), plus 3 that need the network |
+| Tests | **208 tests, all passing** (`cargo test`), plus 3 that need the network |
 | Real npm registry install | verified: `npm install` fetched `is-odd@3.0.1` and its transitive `is-number` from `registry.npmjs.org`, and `node index.js` ran the program |
 | Parallel install throughput | **5.34×** faster with 8 workers than 1 (24 packages, 41.8 MiB unpacked, identical trees) — `scripts/bench-npm-install.ps1` |
 | JavaScript throughput baseline | ~2.2M simple loop iterations/second (`bench-npm-install.ps1`, debug build) |

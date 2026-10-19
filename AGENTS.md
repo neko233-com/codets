@@ -118,6 +118,23 @@ download for users, not as a failing test. Windows ships `.tar.gz` like every ot
 platform: it has had `tar.exe` since Windows 10, and `codets` unpacks its own
 archives anyway.
 
+## Supported platforms
+
+A release publishes five triples: `x86_64-pc-windows-msvc`,
+`aarch64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`
+and `aarch64-apple-darwin`.
+
+**Intel macOS is deliberately not published.** Apple has shipped no Intel Mac since
+2020, and GitHub's last Intel runner image (`macos-13`) is so backlogged that a
+release once queued for hours behind it — while every other platform, including the
+cross-compiled Windows ARM64 build, finished in minutes — and had to be cancelled
+unpublished. `codets upgrade` and both installers tell an Intel Mac that there is no
+published build rather than fetching a binary it cannot run.
+
+The list lives in `release::published_triples()` and in the workflow's matrix, and
+`tests/release_contract.rs` compares the two, so changing one without the other fails
+a test instead of a user's download.
+
 ## Code style
 
 * Comments explain **why**, not what. The surrounding code sets the register: prose,

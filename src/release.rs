@@ -37,20 +37,24 @@ pub fn target_triple() -> Option<&'static str> {
         ("windows", "aarch64") => "aarch64-pc-windows-msvc",
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
         ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
         ("macos", "aarch64") => "aarch64-apple-darwin",
         _ => return None,
     })
 }
 
 /// Every triple a release publishes, for the documentation and the pipeline.
+///
+/// Intel macOS is deliberately absent: Apple has shipped no Intel Mac since 2020, and
+/// GitHub's last Intel runner image (`macos-13`) is so backlogged that a release once
+/// queued for hours behind it while every other platform finished in minutes. An
+/// Intel Mac is told there is no published build rather than handed one it cannot
+/// run. `tests/release_contract.rs` checks this list against the workflow's matrix.
 pub fn published_triples() -> &'static [&'static str] {
     &[
         "x86_64-pc-windows-msvc",
         "aarch64-pc-windows-msvc",
         "x86_64-unknown-linux-gnu",
         "aarch64-unknown-linux-gnu",
-        "x86_64-apple-darwin",
         "aarch64-apple-darwin",
     ]
 }

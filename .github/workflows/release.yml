@@ -13,8 +13,8 @@
 # **Actions minutes are limited, so this runs on tags only.** `workflow_dispatch`
 # exists for a dry run: it builds and uploads the artifacts but creates no release.
 # Everything that can be checked without a runner is checked first, by
-# `scripts/pre-release` locally; the `verify` job below is the last gate before six
-# runners are spent.
+# `scripts/pre-release` locally; the `verify` job below is the last gate before the
+# platform runners are spent.
 
 name: release
 
@@ -114,8 +114,10 @@ jobs:
           # does without.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            os: macos-13
+          # macOS is Apple Silicon only: Apple has shipped no Intel Mac since 2020,
+          # and GitHub's last Intel image (macos-13) is so backlogged that a release
+          # once queued for hours behind it while every other platform finished. See
+          # AGENTS.md, "Supported platforms".
           - target: aarch64-apple-darwin
             os: macos-14
     runs-on: ${{ matrix.os }}

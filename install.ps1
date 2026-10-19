@@ -109,8 +109,8 @@ function Get-Triple {
         }
         'macos' {
             switch ("$arch") {
-                'X64' { 'x86_64-apple-darwin' }
                 'Arm64' { 'aarch64-apple-darwin' }
+                default { throw "no published build for macOS on $arch; codets publishes for Apple Silicon only" }
             }
         }
         'linux' {
@@ -177,7 +177,11 @@ if (-not $version) {
         Fail "CODETS_DOWNLOAD_BASE is set, so the newest version cannot be looked up; set CODETS_VERSION as well"
     }
     $version = Get-LatestVersion
-    if (-not $version) { Fail "cannot determine the newest release" }
+    # An anonymous caller of the releases API is rate-limited hard — a shared egress
+    # address can exhaust the quota on its own — so the message names the way out.
+    if (-not $version) {
+        Fail "cannot determine the newest release from the releases API (it may be rate-limiting an anonymous caller); set CODETS_VERSION to install a specific release"
+    }
 }
 $version = $version.TrimStart('v')
 

@@ -111,9 +111,8 @@ detect_triple() {
             ;;
         Darwin)
             case "$machine" in
-                x86_64) echo "x86_64-apple-darwin" ;;
                 arm64 | aarch64) echo "aarch64-apple-darwin" ;;
-                *) fail "no published build for macOS on $machine" ;;
+                *) fail "no published build for macOS on $machine; codets publishes for Apple Silicon only" ;;
             esac
             ;;
         MINGW* | MSYS* | CYGWIN* | Windows_NT)
@@ -141,7 +140,10 @@ if [ -z "$version" ]; then
         fail "CODETS_DOWNLOAD_BASE is set, so the newest version cannot be looked up; set CODETS_VERSION as well"
     fi
     version="$(latest_version)"
-    [ -n "$version" ] || fail "cannot determine the newest release"
+    # An anonymous caller of the releases API is rate-limited hard — a shared egress
+    # address can exhaust the quota on its own — so the message names the way out.
+    [ -n "$version" ] ||
+        fail "cannot determine the newest release from the releases API (it may be rate-limiting an anonymous caller); set CODETS_VERSION to install a specific release"
 fi
 version="${version#v}"
 
