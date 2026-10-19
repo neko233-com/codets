@@ -64,7 +64,7 @@ the commands in this repository rather than estimated:
 
 | | |
 |---|---|
-| Tests | **208 tests, all passing** (`cargo test`), plus 3 that need the network |
+| Tests | **208 tests, all passing** (`cargo test`), plus 5 that need the network |
 | Real npm registry install | verified: `npm install` fetched `is-odd@3.0.1` and its transitive `is-number` from `registry.npmjs.org`, and `node index.js` ran the program |
 | Parallel install throughput | **5.34×** faster with 8 workers than 1 (24 packages, 41.8 MiB unpacked, identical trees) — `scripts/bench-npm-install.ps1` |
 | JavaScript throughput baseline | ~2.2M simple loop iterations/second (`bench-npm-install.ps1`, debug build) |
@@ -398,13 +398,19 @@ each layer.
 
 ```bash
 cargo build --release      # three binaries in target/release
-cargo test                 # 207 tests, offline
+cargo test                 # 208 tests, offline
 ```
 
 On Windows with a Visual Studio installation that ships only the `onecore` toolset
 libraries, linking fails with `LNK1104: cannot open file 'msvcrt.lib'`. Point `LIB`
 at the MSVC `onecore\x64` folder plus the Windows SDK's `ucrt\x64` and `um\x64`
 folders before running cargo.
+
+Three scripts check what `cargo test` cannot, and all three need the network:
+`scripts/pre-release` is the gate a release has to pass before its tag is pushed,
+`scripts/verify-demo` installs the Vite 8 demo from the real npm registry, and
+`scripts/verify-release` downloads and checks every asset of a published release
+after it exists. `AGENTS.md` describes when each runs.
 
 ## Repository layout
 

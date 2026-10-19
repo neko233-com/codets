@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+* **`scripts/verify-release.{sh,ps1}`**: the check that runs once a release exists.
+  It downloads every asset the published checksum file lists, verifies each digest,
+  lists each archive to confirm it holds the binary and the documents, asserts the
+  asset set is exactly the five platforms, and installs through the one-line
+  installer into a throwaway store that is removed afterwards. A release is not done
+  when the workflow is green; it is done when its assets have been used.
+* **`tests/live_release.rs`**: the same idea inside `cargo test`'s world, opt-in like
+  the live registry tests (`#[ignore]` plus `CODETS_LIVE_RELEASE=1`). One test checks
+  that the published checksum file covers every platform and lists nothing for Intel
+  macOS; the other drives `codets upgrade --to <version>` against the real release
+  and accepts either outcome — the archive was downloaded and verified, and either
+  the running version was already the asked-for one or it was installed.
+
 ## [0.3.0] - 2026-10-19
 
 Self-upgrade, a configurable registry, and the machinery to publish a release and

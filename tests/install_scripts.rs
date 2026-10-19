@@ -467,7 +467,13 @@ fn the_installers_answer_help_without_installing_anything() {
 fn the_install_scripts_are_lf_and_bom_free() {
     // A checked-out CRLF or a byte-order mark is enough to break `sh` on the very
     // first line, and both are easy to introduce from Windows.
-    for name in ["install.sh", "scripts/pre-release.sh", "scripts/check-temp-clean.sh"] {
+    for name in [
+        "install.sh",
+        "scripts/pre-release.sh",
+        "scripts/check-temp-clean.sh",
+        "scripts/verify-release.sh",
+        "scripts/verify-demo.sh",
+    ] {
         let bytes = std::fs::read(repository().join(name)).expect("the script");
         assert!(
             !bytes.starts_with(&[0xef, 0xbb, 0xbf]),

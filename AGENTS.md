@@ -57,6 +57,13 @@ Therefore:
 * Do not tag to "see if the pipeline works". Exercise the same steps locally
   (`scripts/pre-release`, plus the installer test in `tests/install_scripts.rs`);
   the matrix jobs at GitHub are the last place a problem should be discovered.
+* **After the release exists, run `scripts/verify-release` (both shells).** A
+  release is not done when the workflow is green; it is done when its assets have
+  been downloaded, checked against the published checksum file, listed for the
+  binary and documents inside, and installed through both one-line installers into a
+  throwaway store that cleans up after itself. `tests/live_release.rs` is the same
+  idea for `cargo test -- --ignored`, run while `Cargo.toml` still names the released
+  version.
 
 ## Tests
 
@@ -64,8 +71,12 @@ Therefore:
 faked with the directory backend (`Registry::open` on a path), which is why the
 installer takes a `Registry` instead of building one internally.
 
-**Live tests are opt-in and never run in CI.** A test that needs the real registry
-carries `#[ignore]` *and* checks an environment variable before doing anything:
+**Live tests are opt-in and never run in CI.** A test that needs the real world
+carries `#[ignore]` *and* checks an environment variable before doing anything.
+`tests/live_registry.rs` talks to npm with `CODETS_LIVE_REGISTRY=1`;
+`tests/live_release.rs` talks to the published GitHub release with
+`CODETS_LIVE_RELEASE=1`, and belongs to the moment right after publishing, while
+`Cargo.toml` still names the released version:
 
 ```rust
 #[test]
